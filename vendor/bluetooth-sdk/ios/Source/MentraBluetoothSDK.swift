@@ -1,0 +1,2868 @@
+import CoreBluetooth
+import Foundation
+
+@MainActor
+private final class ActiveScanSession {
+    let model: DeviceModel
+    let onResults: ([Device]) -> Void
+    let onComplete: ([Device]) -> Void
+    let onDiagnostic: ((ScanDiagnostic) -> Void)?
+    var latestResults: [Device] = []
+    var timeoutTask: Task<Void, Never>?
+    weak var publicSession: ScanSession?
+
+    init(
+        model: DeviceModel,
+        onResults: @escaping ([Device]) -> Void,
+        onComplete: @escaping ([Device]) -> Void,
+        onDiagnostic: ((ScanDiagnostic) -> Void)?
+    ) {
+        self.model = model
+        self.onResults = onResults
+        self.onComplete = onComplete
+        self.onDiagnostic = onDiagnostic
+    }
+}
+
+@MainActor
+private final class PendingWifiScan {
+    let pending: PendingResponse<[WifiScanResult]>
+    let scanId: String
+    var latestResults: [WifiScanResult] = []
+    /// Chunks accumulated from scanId-echoing glasses, deduplicated by SSID;
+    /// resolved only when the glasses flag the scan complete.
+    var accumulated: [WifiScanResult] = []
+
+    init(pending: PendingResponse<[WifiScanResult]>, scanId: String) {
+        self.pending = pending
+        self.scanId = scanId
+    }
+}
+
+@MainActor
+private final class PendingWifiStatusRequest {
+    let ssid: String
+    let pending: PendingResponse<WifiStatusEvent>
+
+    init(
+        ssid: String,
+        pending: PendingResponse<WifiStatusEvent>
+    ) {
+        self.ssid = ssid
+        self.pending = pending
+    }
+}
+
+@MainActor
+private final class PendingWifiForgetRequest {
+    let ssid: String
+    let requestId: String
+    var sid: String
+    let epoch: UInt64
+    let pending: PendingResponse<WifiForgetResult>
+    var mode: WifiRequestMode
+    var commandSent = false
+
+    init(
+        ssid: String,
+        requestId: String,
+        sid: String,
+        epoch: UInt64,
+        pending: PendingResponse<WifiForgetResult>,
+        mode: WifiRequestMode
+    ) {
+        self.ssid = ssid
+        self.requestId = requestId
+        self.sid = sid
+        self.epoch = epoch
+        self.pending = pending
+        self.mode = mode
+    }
+}
+
+@MainActor
+private final class PendingSavedWifiNetworks {
+    let requestId: String
+    var sid: String
+    let epoch: UInt64
+    let pending: PendingResponse<SavedWifiNetworksResult>
+    var mode: WifiRequestMode
+    var commandSent = false
+
+    init(
+        requestId: String,
+        sid: String,
+        epoch: UInt64,
+        pending: PendingResponse<SavedWifiNetworksResult>,
+        mode: WifiRequestMode
+    ) {
+        self.requestId = requestId
+        self.sid = sid
+        self.epoch = epoch
+        self.pending = pending
+        self.mode = mode
+    }
+}
+
+@MainActor
+private final class PendingHotspotStatusRequest {
+    let enabled: Bool
+    let pending: PendingResponse<HotspotStatusEvent>
+
+    init(enabled: Bool, pending: PendingResponse<HotspotStatusEvent>) {
+        self.enabled = enabled
+        self.pending = pending
+    }
+}
+
+@MainActor
+private final class PendingVideoRecordingRequest {
+    let expectedStatus: String
+    let pending: PendingResponse<VideoRecordingStatusEvent>
+    let waitForUpload: Bool
+    var stoppedEvent: VideoRecordingStatusEvent?
+    var uploadSucceeded = false
+
+    init(expectedStatus: String, pending: PendingResponse<VideoRecordingStatusEvent>, waitForUpload: Bool = false) {
+        self.expectedStatus = expectedStatus
+        self.pending = pending
+        self.waitForUpload = waitForUpload
+    }
+}
+
+@MainActor
+private final class PendingVersionInfoRequest {
+    let pending: PendingResponse<VersionInfoResult>
+    let accumulator: VersionInfoResponseAccumulator
+    let requestId: String
+    let startedAt = ProcessInfo.processInfo.systemUptime
+
+    init(pending: PendingResponse<VersionInfoResult>, requestId: String) {
+        self.pending = pending
+        self.requestId = requestId
+        accumulator = VersionInfoResponseAccumulator(expectedRequestId: requestId)
+    }
+}
+
+/// seq records send order (assigned and handed to the BLE queue in a single
+/// MainActor turn) so that an id-carrying status for a newer start can
+/// identify which older in-flight starts it preempted.
+@MainActor
+private final class PendingStreamStart {
+    let seq: Int
+    let pending: PendingResponse<StreamStatusEvent>
+    /// Set when an id-carrying error arrives: a fatal publisher error never
+    /// reaches the reconnect machinery and winds down with a streamId-less
+    /// stopped, so the stash both attributes that stopped to this start and
+    /// preserves the real error details for the rejection.
+    var lastError: StreamStatusEvent?
+
+    init(seq: Int, pending: PendingResponse<StreamStatusEvent>) {
+        self.seq = seq
+        self.pending = pending
+    }
+}
+
+@MainActor
+final class PendingResponse<T> {
+    private let operation: String
+    /// The operation without per-request ids, so timeouts group in analytics.
+    private let telemetryOperation: String
+    private let onTimeout: ((String) -> Void)?
+    private var continuation: CheckedContinuation<T, Error>?
+    private var timeoutTask: Task<Void, Never>?
+    private var result: Result<T, Error>?
+    private var completed = false
+
+    init(operation: String, telemetryOperation: String? = nil, onTimeout: ((String) -> Void)? = nil) {
+        self.operation = operation
+        self.telemetryOperation = telemetryOperation ?? operation
+        self.onTimeout = onTimeout
+    }
+
+    func resolve(_ value: T) {
+        guard !completed else { return }
+        completed = true
+        result = .success(value)
+        timeoutTask?.cancel()
+        continuation?.resume(returning: value)
+        continuation = nil
+    }
+
+    func reject(_ error: Error) {
+        guard !completed else { return }
+        completed = true
+        result = .failure(error)
+        timeoutTask?.cancel()
+        continuation?.resume(throwing: error)
+        continuation = nil
+    }
+
+    func wait(timeoutMs: Int? = 15000) async throws -> T {
+        if Task.isCancelled {
+            throw BluetoothSdkError(code: "request_cancelled", message: "\(operation) was cancelled.")
+        }
+        if let result {
+            return try result.get()
+        }
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                self.continuation = continuation
+                if let timeoutMs {
+                    timeoutTask = Task { @MainActor [weak self] in
+                        do {
+                            try await Task.sleep(nanoseconds: UInt64(timeoutMs) * 1_000_000)
+                        } catch {
+                            return
+                        }
+                        guard let self, !self.completed else { return }
+                        self.onTimeout?(self.telemetryOperation)
+                        self.reject(
+                            BluetoothSdkError(
+                                code: "request_timeout",
+                                message: "\(self.operation) timed out waiting for glasses response."
+                            )
+                        )
+                    }
+                }
+            }
+        } onCancel: {
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                reject(
+                    BluetoothSdkError(
+                        code: "request_cancelled",
+                        message: "\(operation) was cancelled."
+                    )
+                )
+            }
+        }
+    }
+}
+
+@MainActor
+public final class MentraBluetoothSDK {
+    // Mirrors AsgConstants: one active + one coalesced pending FOV update, plus BLE margin.
+    // Keep in sync with Android MentraBluetoothSdk and the ASG readiness budget.
+    private static let cameraFovReadyTimeoutMs = 20000
+    private static let cameraFovDeliveryMarginMs = 5000
+    private static let cameraFovRequestTimeoutMs =
+        2 * cameraFovReadyTimeoutMs + cameraFovDeliveryMarginMs
+    private static let wifiScanTimeoutMs = 20000
+    /// A photo response is terminal only after capture, encoding, transport, and upload.
+    /// Max-quality BLE fallback can legitimately exceed the generic command deadline.
+    private static let photoRequestTimeoutMs = 30000
+    // Mirrors AsgConstants.PHOTO_THUMBNAIL_REQUEST_TIMEOUT_MS and the Android facade.
+    // Reserve capture, preview ACK/retries, full delivery, then terminal-event transit.
+    private static let photoCaptureTimeoutMs = 45000
+    private static let photoThumbnailTimeoutSeconds = 30
+    private static let photoDeliveryTimeoutMs = 30000
+    private static let photoResponseMarginMs = 5000
+    private static let photoThumbnailRequestTimeoutMs =
+        photoCaptureTimeoutMs + photoThumbnailTimeoutSeconds * 1000
+            + photoDeliveryTimeoutMs + photoResponseMarginMs
+    private static let otaBesVersionWaitMs = 5000
+    private static let otaMtkVersionWaitMs = 2000
+    private static let otaVersionPollMs = 100
+    private static let micStateKeys: Set<String> = ["currentMic", "should_send_transcript", "local_stt_fallback_active"]
+
+    public weak var delegate: MentraBluetoothSDKDelegate?
+
+    private let configuration: MentraBluetoothSDKConfiguration
+    private var discoveredDeviceNames = Set<String>()
+    private var bluetoothAvailabilityListenerId: UUID?
+    private var shouldRestoreGlassesOnBluetoothRestore = false
+    private var shouldRestoreControllerOnBluetoothRestore = false
+    private var requiresAncsForBluetoothRestore = true
+    private var bridgeEventSinkId: String?
+    private var storeListenerId: String?
+    private let defaultDeviceKeys: Set<String> = ["default_wearable", "device_name", "device_address", "project_name"]
+    private let videoUploadStopTimeoutMs = 10 * 60 * 1000
+    private var suppressDefaultDeviceEvents = false
+    private var defaultDeviceApplyGeneration = 0
+    private var activeScanSessions: [UUID: ActiveScanSession] = [:]
+    private let streamSession = StreamSessionState()
+    private let analytics: BluetoothSdkAnalytics
+    private var updateCheck: BluetoothSdkUpdateCheck?
+    private var pendingPhotoRequests: [String: PendingResponse<PhotoResponseEvent>] = [:]
+    private var pendingCameraStatusRequests: [String: PendingResponse<CameraStatusEvent>] = [:]
+    private var pendingVideoRecordingRequests: [String: PendingVideoRecordingRequest] = [:]
+    private var pendingRgbLedRequests: [String: PendingResponse<RgbLedControlResponseEvent>] = [:]
+    private var pendingSettingsRequests: [String: PendingResponse<SettingsAckEvent>] = [:]
+    private var pendingStreamStarts: [String: PendingStreamStart] = [:]
+    private var streamStartSeq = 0
+    // seq is the stop's slot in the shared streamStartSeq order (drawn in the
+    // same await-free MainActor turn that sends the command): every pending
+    // start with a lower seq reached the glasses' FIFO before this stop.
+    private var pendingStreamStop: (streamId: String?, seq: Int, pending: PendingResponse<StreamStatusEvent>)?
+    private var pendingGalleryStatus: PendingResponse<GalleryStatusEvent>?
+    private var pendingOtaQuery: PendingResponse<OtaQueryResult>?
+    private var pendingOtaStart: PendingResponse<OtaStartAckEvent>?
+    private var pendingWifiScan: PendingWifiScan?
+    private var pendingSavedWifiNetworks: PendingSavedWifiNetworks?
+    private var wifiScanTask: Task<[WifiScanResult], Error>?
+    private var pendingWifiStatus: PendingWifiStatusRequest?
+    private var pendingWifiForget: PendingWifiForgetRequest?
+    private var pendingHotspotStatus: PendingHotspotStatusRequest?
+    /// Serializes enable/disable so SoftAP teardown's second disable waits
+    /// instead of throwing `request_in_flight` and refusing the next join.
+    private var hotspotTail: Task<HotspotStatusEvent, Error>?
+    private var pendingVersionInfo: PendingVersionInfoRequest?
+    private let besCrashReports = BesCrashReportWaiters()
+    private static let besCrashReportedTimeoutMs = 10000
+    private let wifiSessionCapabilities = WifiSessionCapabilities()
+    private var configuredOtaVersionUrl: String?
+
+    /// Whether the app declares the `bluetooth-central` background mode. When false on iOS, the
+    /// glasses stay disconnected after a link drop until the user opens the app, so a software
+    /// update started on a locked phone stalls. Always true on macOS.
+    public static var supportsBackgroundReconnect: Bool {
+        BluetoothBackgroundMode.isDeclared(in: Bundle.main.infoDictionary)
+    }
+
+    private static var didWarnMissingBackgroundMode = false
+
+    public init(configuration: MentraBluetoothSDKConfiguration = .default) {
+        self.configuration = configuration
+        // Once per process: apps may create the SDK more than once.
+        if !Self.didWarnMissingBackgroundMode, !Self.supportsBackgroundReconnect {
+            Self.didWarnMissingBackgroundMode = true
+            Bridge.log(BluetoothBackgroundMode.missingWarning)
+        }
+        analytics = BluetoothSdkAnalytics(configuration: configuration.analytics)
+        bluetoothAvailabilityListenerId = BluetoothAvailability.shared.addStateListener { [weak self] state in
+            Task { @MainActor [weak self] in
+                self?.handleBluetoothAvailability(state)
+            }
+        }
+        bridgeEventSinkId = Bridge.addEventSink { [weak self] eventName, data in
+            // Bridge.dispatchEvent always invokes sinks on the main thread, in the
+            // FIFO order events were dispatched (correlated WiFi-scan chunks rely
+            // on that order). A fresh Task per event can reach the MainActor out
+            // of creation order and reorder chunks, so consume synchronously
+            // while still on main.
+            if Thread.isMainThread {
+                MainActor.assumeIsolated {
+                    self?.dispatchBridgeEvent(eventName, data)
+                }
+            } else {
+                // Defensive fallback only — Bridge.dispatchEvent should never take
+                // this path. A serial main-queue hop still preserves FIFO order,
+                // unlike an unstructured Task.
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated {
+                        self?.dispatchBridgeEvent(eventName, data)
+                    }
+                }
+            }
+        }
+        DeviceManager.shared.sgc?.replayStreamControlReady()
+        storeListenerId = DeviceStore.shared.store.addListener { [weak self] category, changes in
+            Task { @MainActor [weak self] in
+                self?.dispatchStoreUpdate(category, changes)
+            }
+        }
+        analytics.initializeGlassesStatus(glassesStatus)
+        analytics.captureStarted()
+        let updateCheck = BluetoothSdkUpdateCheck(
+            surface: BluetoothSdkUpdateCheck.surface(forAnalyticsSurface: configuration.analytics.surface)
+        ) { [weak self] banner, result in
+            NSLog("%@", banner)
+            var values: [String: Any] = [
+                "message": banner,
+                "status": result.status,
+                "installedVersion": BluetoothSdkDefaults.sdkVersion ?? "unknown",
+            ]
+            if let latestVersion = result.latestVersion { values["latestVersion"] = latestVersion }
+            let notice = values
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.delegate?.mentraBluetoothSDK(self, didReceive: .raw(name: "sdk_update_notice", values: notice))
+            }
+        }
+        self.updateCheck = updateCheck
+        updateCheck.start()
+    }
+
+    /// Reports a glasses command that timed out, without its per-request id.
+    private var requestTimeoutReporter: (String) -> Void {
+        { [weak self] operation in
+            self?.analytics.recordUsage { $0.requestTimedOut(operation: operation) }
+        }
+    }
+
+    public var state: MentraBluetoothState {
+        MentraBluetoothState(glassesStatus: glassesStatus, bluetoothStatus: bluetoothStatus)
+    }
+
+    public var glasses: GlassesRuntimeState {
+        state.glasses
+    }
+
+    public var sdkState: PhoneSdkRuntimeState {
+        state.sdk
+    }
+
+    public var scanState: BluetoothScanState {
+        state.scan
+    }
+
+    var glassesStatus: GlassesStatus {
+        GlassesStatus(values: DeviceStore.shared.store.getCategory("glasses"))
+    }
+
+    var bluetoothStatus: BluetoothStatus {
+        BluetoothStatus(values: DeviceStore.shared.store.getCategory(ObservableStore.bluetoothCategory))
+    }
+
+    public var defaultDevice: Device? {
+        currentDefaultDevice()
+    }
+
+    private func requireGlassesConnected(operation: String) throws {
+        guard glassesStatus.connected else {
+            throw BluetoothSdkError(
+                code: "glasses_not_connected",
+                message: "Cannot \(operation) because glasses are not connected."
+            )
+        }
+    }
+
+    public func getDefaultDevice() -> Device? {
+        currentDefaultDevice()
+    }
+
+    public func setDefaultDevice(_ device: Device?) {
+        guard let device else {
+            clearDefaultDevice()
+            return
+        }
+        defaultDeviceApplyGeneration += 1
+        let generation = defaultDeviceApplyGeneration
+        suppressDefaultDeviceEvents = true
+        DeviceStore.shared.apply(ObservableStore.bluetoothCategory, "default_wearable", device.model.deviceType)
+        DeviceStore.shared.apply(ObservableStore.bluetoothCategory, "device_name", device.name)
+        DeviceStore.shared.apply(ObservableStore.bluetoothCategory, "device_address", device.identifier ?? "")
+        DeviceStore.shared.apply(ObservableStore.bluetoothCategory, "project_name", device.projectName ?? "")
+        DeviceStore.shared.apply(ObservableStore.bluetoothCategory, "pending_device_name", "")
+        DeviceStore.shared.apply(ObservableStore.bluetoothCategory, "pending_device_address", "")
+        DeviceStore.shared.apply(ObservableStore.bluetoothCategory, "pending_device_secure_pairing_capable", "")
+        finishDefaultDeviceApply(generation: generation)
+    }
+
+    private func clearDefaultDevice() {
+        defaultDeviceApplyGeneration += 1
+        let generation = defaultDeviceApplyGeneration
+        suppressDefaultDeviceEvents = true
+        DeviceStore.shared.apply(ObservableStore.bluetoothCategory, "default_wearable", "")
+        DeviceStore.shared.apply(ObservableStore.bluetoothCategory, "device_name", "")
+        DeviceStore.shared.apply(ObservableStore.bluetoothCategory, "device_address", "")
+        DeviceStore.shared.apply(ObservableStore.bluetoothCategory, "project_name", "")
+        DeviceStore.shared.apply(ObservableStore.bluetoothCategory, "pending_device_name", "")
+        DeviceStore.shared.apply(ObservableStore.bluetoothCategory, "pending_device_address", "")
+        DeviceStore.shared.apply(ObservableStore.bluetoothCategory, "pending_device_secure_pairing_capable", "")
+        finishDefaultDeviceApply(generation: generation)
+    }
+
+    public func startScan(model: DeviceModel) throws {
+        if model != .simulated {
+            try BluetoothAvailability.shared.requirePoweredOn(operation: "scan for glasses")
+        }
+        discoveredDeviceNames.removeAll()
+        DeviceStore.shared.apply(ObservableStore.bluetoothCategory, "searching", true)
+        DeviceManager.shared.findCompatibleDevices(model.deviceType)
+    }
+
+    public func stopScan() {
+        stopScan(reason: .cancelled)
+    }
+
+    private func stopScan(reason: ScanStopReason) {
+        DeviceManager.shared.stopScan()
+        DeviceStore.shared.apply(ObservableStore.bluetoothCategory, "searching", false)
+        delegate?.mentraBluetoothSDK(self, didStopScan: reason)
+    }
+
+    @discardableResult
+    public func scan(
+        model: DeviceModel,
+        timeout: TimeInterval = 15,
+        onResults: @escaping ([Device]) -> Void,
+        onComplete: @escaping ([Device]) -> Void = { _ in }
+    ) throws -> ScanSession {
+        try scan(model: model, timeout: timeout, onResults: onResults, onDiagnostic: nil, onComplete: onComplete)
+    }
+
+    /// Optional advisory before an empty completed scan. Existing scan overloads
+    /// retain their signatures and behavior; cancellation does not produce hints.
+    @discardableResult
+    public func scan(
+        model: DeviceModel,
+        timeout: TimeInterval = 15,
+        onResults: @escaping ([Device]) -> Void,
+        onDiagnostic: ((ScanDiagnostic) -> Void)?,
+        onComplete: @escaping ([Device]) -> Void = { _ in }
+    ) throws -> ScanSession {
+        let normalizedTimeout = timeout > 0 && timeout.isFinite ? timeout : 15
+        let id = UUID()
+        let activeSession = ActiveScanSession(
+            model: model,
+            onResults: onResults,
+            onComplete: onComplete,
+            onDiagnostic: onDiagnostic
+        )
+        let publicSession = ScanSession { [weak self] in
+            self?.finishScanSession(id, reason: .cancelled, shouldStopScan: true)
+        }
+        activeSession.publicSession = publicSession
+        activeScanSessions[id] = activeSession
+
+        do {
+            emitScanResults([], forSession: id)
+            try startScan(model: model)
+            emitScanResults(bluetoothStatus.searchResults.filter { $0.model == model }, forSession: id)
+            activeSession.timeoutTask = Task { [weak self] in
+                let nanoseconds = UInt64(normalizedTimeout * 1_000_000_000)
+                try? await Task.sleep(nanoseconds: nanoseconds)
+                await self?.finishScanSession(id, reason: .completed, shouldStopScan: true)
+            }
+            return publicSession
+        } catch {
+            activeScanSessions[id] = nil
+            publicSession.markStopped()
+            throw error
+        }
+    }
+
+    public func connect(to device: Device, options: ConnectOptions = ConnectOptions()) throws {
+        clearBluetoothRestoreIntent()
+        if device.model != .simulated {
+            try BluetoothAvailability.shared.requirePoweredOn(operation: "connect to glasses")
+        }
+        let isController = ControllerTypes.ALL.contains(device.model.deviceType)
+        if !isController {
+            requiresAncsForBluetoothRestore = options.requiresAncs
+            MentraLive.enableTransportBridging = options.enableTransportBridging
+        }
+        if options.cancelExistingConnectionAttempt {
+            if isController {
+                DeviceManager.shared.disconnectController()
+            } else {
+                cancelConnectionAttempt()
+            }
+        }
+        if !isController {
+            MentraLive.clearStaleIosBondPrompt()
+        }
+        if options.saveAsDefault && !isController {
+            setDefaultDevice(device)
+        } else if !isController {
+            DeviceStore.shared.apply(ObservableStore.bluetoothCategory, "pending_device_name", device.name)
+            DeviceStore.shared.apply(ObservableStore.bluetoothCategory, "pending_device_address", device.identifier ?? "")
+            DeviceStore.shared.apply(
+                ObservableStore.bluetoothCategory,
+                "pending_device_secure_pairing_capable",
+                device.securePairingCapable ?? ""
+            )
+        }
+        DeviceStore.shared.apply(ObservableStore.bluetoothCategory, "pending_wearable", device.model.deviceType)
+        DeviceManager.shared.connectByName(device.name, requiresAncs: options.requiresAncs)
+    }
+
+    public func connectDefault(options: ConnectOptions = ConnectOptions()) throws {
+        clearBluetoothRestoreIntent()
+        requiresAncsForBluetoothRestore = options.requiresAncs
+        MentraLive.enableTransportBridging = options.enableTransportBridging
+        guard let device = currentDefaultDevice() else {
+            throw BluetoothSdkError(
+                code: "default_device_missing",
+                message: "Set a default glasses device before calling connectDefault."
+            )
+        }
+        if device.model != .simulated {
+            try BluetoothAvailability.shared.requirePoweredOn(operation: "connect to glasses")
+        }
+        if options.cancelExistingConnectionAttempt {
+            cancelConnectionAttempt()
+        }
+        DeviceManager.shared.connectDefault(requiresAncs: options.requiresAncs)
+    }
+
+    public func cancelConnectionAttempt() {
+        analytics.noteDisconnectRequested(BluetoothSdkAnalyticsTracker.disconnectCancel)
+        clearBluetoothRestoreIntent()
+        DeviceStore.shared.apply(ObservableStore.bluetoothCategory, "pending_device_name", "")
+        DeviceStore.shared.apply(ObservableStore.bluetoothCategory, "pending_device_address", "")
+        DeviceStore.shared.apply(ObservableStore.bluetoothCategory, "pending_device_secure_pairing_capable", "")
+        DeviceManager.shared.disconnect()
+    }
+
+    func connectSimulated() {
+        clearBluetoothRestoreIntent()
+        DeviceManager.shared.connectSimulated()
+    }
+
+    public func disconnect() {
+        analytics.noteDisconnectRequested(BluetoothSdkAnalyticsTracker.disconnectUser)
+        clearBluetoothRestoreIntent()
+        DeviceStore.shared.apply(ObservableStore.bluetoothCategory, "pending_device_name", "")
+        DeviceStore.shared.apply(ObservableStore.bluetoothCategory, "pending_device_address", "")
+        DeviceStore.shared.apply(ObservableStore.bluetoothCategory, "pending_device_secure_pairing_capable", "")
+        DeviceManager.shared.disconnect()
+    }
+
+    public func forget() {
+        analytics.noteDisconnectRequested(BluetoothSdkAnalyticsTracker.disconnectForget)
+        clearBluetoothRestoreIntent()
+        DeviceManager.shared.forget()
+    }
+
+    /// Unpair the glasses: disconnect, forget the default device and, on Mentra Live, remove the phone's Bluetooth bond.
+    public func unpair() async throws {
+        analytics.noteDisconnectRequested(BluetoothSdkAnalyticsTracker.disconnectForget)
+        clearBluetoothRestoreIntent()
+        try await DeviceManager.shared.unpair()
+    }
+
+    public func displayText(_ text: String, x: Int = 0, y: Int = 0, size: Int = 24) async throws {
+        try await displayText(DisplayTextRequest(text: text, x: x, y: y, size: size))
+    }
+
+    public func displayText(_ request: DisplayTextRequest) async throws {
+        DeviceManager.shared.displayText(request.dictionary)
+    }
+
+    func displayEvent(_ request: DisplayEventRequest) async throws {
+        DeviceManager.shared.displayEvent(request.values)
+    }
+
+    public func clearDisplay() async throws {
+        DeviceManager.shared.sgc?.clearDisplay()
+    }
+
+    /// Sets session-only content shown below the standard dashboard status header.
+    public func setDashboardContent(_ content: String) async {
+        await DeviceManager.shared.setDashboardContent(content)
+    }
+
+    public func showDashboard() {
+        DeviceManager.shared.showDashboard()
+    }
+
+    public func configureNativeNotifications(_ config: NativeNotificationConfig) throws {
+        try config.validate()
+        guard let driver = DeviceManager.shared.sgc else { throw NativeNotificationError.notConnected }
+        try driver.configureNativeNotifications(config)
+    }
+
+    public func getNativeNotificationStatus() -> NativeNotificationStatus {
+        DeviceManager.shared.sgc?.getNativeNotificationStatus() ?? .unavailable
+    }
+
+    public func showNotificationsPanel() {
+        DeviceManager.shared.showNotificationsPanel()
+    }
+
+    func setBrightness(_ level: Int, autoMode: Bool? = nil) async throws {
+        if let autoMode {
+            DeviceStore.shared.apply(ObservableStore.bluetoothCategory, "auto_brightness", autoMode)
+        }
+        DeviceStore.shared.apply(ObservableStore.bluetoothCategory, "brightness", level)
+    }
+
+    func setAutoBrightness(enabled: Bool) async throws {
+        DeviceStore.shared.apply(ObservableStore.bluetoothCategory, "auto_brightness", enabled)
+    }
+
+    public func setDashboardPosition(height: Int, depth: Int) async throws {
+        DeviceStore.shared.apply(ObservableStore.bluetoothCategory, "dashboard_height", height)
+        DeviceStore.shared.apply(ObservableStore.bluetoothCategory, "dashboard_depth", depth)
+    }
+
+    public func setDashboardPosition(_ request: DashboardPositionRequest) async throws {
+        try await setDashboardPosition(height: request.height, depth: request.depth)
+    }
+
+    func setDashboardMenu(_ items: [DashboardMenuItem]) async throws {
+        DeviceStore.shared.apply(
+            ObservableStore.bluetoothCategory,
+            "menu_apps",
+            items.map(\.dictionary)
+        )
+    }
+
+    func setCalendarEvents(_ events: [CalendarEvent]) async throws {
+        DeviceStore.shared.apply(
+            ObservableStore.bluetoothCategory,
+            "calendar_events",
+            events.map(\.dictionary)
+        )
+    }
+
+    public func setHeadUpAngle(_ angleDegrees: Int) async throws {
+        DeviceStore.shared.apply(ObservableStore.bluetoothCategory, "head_up_angle", angleDegrees)
+    }
+
+    public func setScreenDisabled(_ disabled: Bool) async throws {
+        DeviceStore.shared.apply(ObservableStore.bluetoothCategory, "screen_disabled", disabled)
+    }
+
+    /// Enable or disable persistent, unauthenticated HTTP gallery access on the glasses' Wi-Fi.
+    /// Defaults off and survives glasses restarts. Only enable on a trusted network.
+    /// The ack reports the saved `enabled` state and current `listening`/`url` separately.
+    public func setGalleryServerEnabled(_ enabled: Bool) async throws -> SettingsAckEvent {
+        try await performSettingsCommand(
+            setting: "gallery_server",
+            updateStore: { _ in },
+            send: { requestId in try DeviceManager.shared.sendGalleryServerEnabled(requestId: requestId, enabled: enabled) }
+        )
+    }
+
+    /// Disable a stock action while retaining touch events. Reset by BES on BLE disconnect.
+    public func setTouchGestureDefaultBehaviorEnabled(_ gesture: TouchGesture, enabled: Bool) async throws -> SettingsAckEvent {
+        try await performSettingsCommand(
+            setting: "touch_gesture_default",
+            updateStore: { _ in },
+            send: { requestId in
+                try DeviceManager.shared.sendTouchGestureDefaultBehaviorEnabled(requestId: requestId, gesture: gesture, enabled: enabled)
+            }
+        )
+    }
+
+    public func setGalleryModeEnabled(_ enabled: Bool) async throws -> SettingsAckEvent {
+        try await performSettingsCommand(
+            setting: "gallery_mode",
+            updateStore: { _ in DeviceStore.shared.set(ObservableStore.bluetoothCategory, "gallery_mode", enabled) },
+            send: { requestId in try DeviceManager.shared.sendGalleryMode(requestId: requestId, enabled: enabled) }
+        )
+    }
+
+    private func performSettingsCommand(
+        setting: String,
+        updateStore: (SettingsAckEvent) -> Void,
+        send: (String) throws -> Void
+    ) async throws -> SettingsAckEvent {
+        let requestId = "settings-\(setting)-\(UUID().uuidString)"
+        let pending = PendingResponse<SettingsAckEvent>(operation: "set \(setting)", onTimeout: requestTimeoutReporter)
+        pendingSettingsRequests[requestId] = pending
+        do {
+            try send(requestId)
+            let timeoutMs = (setting == "camera_fov" || setting == "camera_fov_override")
+                ? Self.cameraFovRequestTimeoutMs : 15000
+            let ack = try await pending.wait(timeoutMs: timeoutMs)
+            updateStore(ack)
+            pendingSettingsRequests.removeValue(forKey: requestId)
+            return ack
+        } catch {
+            pendingSettingsRequests.removeValue(forKey: requestId)
+            throw error
+        }
+    }
+
+    public func setVoiceActivityDetectionEnabled(_ enabled: Bool) async throws {
+        DeviceStore.shared.apply(ObservableStore.bluetoothCategory, "voice_activity_detection_enabled", enabled)
+    }
+
+    public func setLoudnessGateEnabled(_ enabled: Bool) async throws {
+        DeviceStore.shared.apply(ObservableStore.bluetoothCategory, "loudness_gate_enabled", enabled)
+    }
+
+    public func setAutoPowerOffEnabled(_ enabled: Bool) async throws {
+        DeviceStore.shared.apply(ObservableStore.bluetoothCategory, "auto_power_off_enabled", enabled)
+    }
+
+    @available(*, deprecated, message: "Sticky action-button photo presets are deprecated. Prefer per-request requestPhoto(...) options (e.g. mode .text for text sensor size/crop, or explicit per-shot fields). This method still works but will be removed in a future release.")
+    public func setPhotoCaptureDefaults(_ settings: PhotoCaptureDefaults) async throws -> SettingsAckEvent {
+        try await performSettingsCommand(
+            setting: "button_photo",
+            updateStore: { _ in
+                if settings.resetCaptureTuning == true {
+                    // Mirror Android: clear all cached scan-tuning keys so reconnect sync
+                    // does not replay stale values after a reset.
+                    let cat = ObservableStore.bluetoothCategory
+                    for key in ["button_photo_zsl_mfnr", "button_photo_mfnr", "button_photo_zsl", "button_photo_noise_reduction",
+                                "button_photo_edge_enhancement", "button_photo_isp_digital_gain",
+                                "button_photo_isp_analog_gain", "button_photo_ae_exposure_divisor",
+                                "button_photo_iso_cap", "button_photo_compress", "button_photo_sound"]
+                    {
+                        DeviceStore.shared.remove(cat, key)
+                    }
+                }
+                if let size = settings.size {
+                    DeviceStore.shared.set(ObservableStore.bluetoothCategory, "button_photo_size", size.rawValue)
+                }
+                if let mfnr = settings.mfnr {
+                    DeviceStore.shared.set(ObservableStore.bluetoothCategory, "button_photo_mfnr", mfnr)
+                }
+                if let zsl = settings.zsl {
+                    DeviceStore.shared.set(ObservableStore.bluetoothCategory, "button_photo_zsl", zsl)
+                }
+                if let noiseReduction = settings.noiseReduction {
+                    DeviceStore.shared.set(ObservableStore.bluetoothCategory, "button_photo_noise_reduction", noiseReduction)
+                }
+                if let edgeEnhancement = settings.edgeEnhancement {
+                    DeviceStore.shared.set(ObservableStore.bluetoothCategory, "button_photo_edge_enhancement", edgeEnhancement)
+                }
+                if let ispDigitalGain = settings.ispDigitalGain {
+                    DeviceStore.shared.set(ObservableStore.bluetoothCategory, "button_photo_isp_digital_gain", ispDigitalGain)
+                }
+                if let ispAnalogGain = settings.ispAnalogGain {
+                    DeviceStore.shared.set(ObservableStore.bluetoothCategory, "button_photo_isp_analog_gain", ispAnalogGain)
+                }
+                if let aeExposureDivisor = settings.aeExposureDivisor {
+                    DeviceStore.shared.set(
+                        ObservableStore.bluetoothCategory,
+                        "button_photo_ae_exposure_divisor",
+                        aeExposureDivisor
+                    )
+                }
+                if let isoCap = settings.isoCap {
+                    DeviceStore.shared.set(ObservableStore.bluetoothCategory, "button_photo_iso_cap", isoCap)
+                }
+                if let compress = settings.compress {
+                    DeviceStore.shared.set(ObservableStore.bluetoothCategory, "button_photo_compress", compress.rawValue)
+                }
+                if let sound = settings.sound {
+                    DeviceStore.shared.set(ObservableStore.bluetoothCategory, "button_photo_sound", sound)
+                }
+            },
+            send: { requestId in
+                try DeviceManager.shared.sendButtonPhotoSettings(requestId: requestId, settings: settings)
+            }
+        )
+    }
+
+    public func setVideoRecordingDefaults(_ defaults: VideoRecordingDefaults) async throws -> SettingsAckEvent {
+        try await performSettingsCommand(
+            setting: "button_video_recording",
+            updateStore: { _ in
+                DeviceStore.shared.set(
+                    ObservableStore.bluetoothCategory,
+                    "button_video_settings",
+                    ["width": defaults.width, "height": defaults.height, "fps": defaults.fps]
+                )
+                // Keep legacy cache keys readable for older internal callers during migration.
+                DeviceStore.shared.set(ObservableStore.bluetoothCategory, "button_video_width", defaults.width)
+                DeviceStore.shared.set(ObservableStore.bluetoothCategory, "button_video_height", defaults.height)
+                DeviceStore.shared.set(ObservableStore.bluetoothCategory, "button_video_fps", defaults.fps)
+            },
+            send: { requestId in
+                try DeviceManager.shared.sendButtonVideoRecordingSettings(
+                    requestId: requestId,
+                    width: defaults.width,
+                    height: defaults.height,
+                    fps: defaults.fps
+                )
+            }
+        )
+    }
+
+    public func setMaxVideoRecordingDuration(minutes: Int) async throws -> SettingsAckEvent {
+        try await performSettingsCommand(
+            setting: "button_max_recording_time",
+            updateStore: { _ in
+                DeviceStore.shared.set(ObservableStore.bluetoothCategory, "button_max_recording_time", minutes)
+            },
+            send: { requestId in
+                try DeviceManager.shared.sendButtonMaxRecordingTime(requestId: requestId, minutes: minutes)
+            }
+        )
+    }
+
+    public func setCameraFov(_ fov: CameraFov) async throws -> CameraFovResult {
+        let ack = try await performSettingsCommand(
+            setting: "camera_fov",
+            updateStore: { _ in },
+            send: { requestId in
+                try DeviceManager.shared.sendCameraFovSetting(
+                    requestId: requestId,
+                    fov: fov.fov,
+                    roiPosition: fov.roiPosition.rawValue
+                )
+            }
+        )
+        let result = try CameraFovResult.from(ack: ack, fallback: fov)
+        DeviceStore.shared.set(
+            ObservableStore.bluetoothCategory,
+            "camera_fov",
+            ["fov": result.fov, "roi_position": result.roiPosition.rawValue]
+        )
+        return result
+    }
+
+    /// Compatibility path for ASG clients that support only the older one-way FOV command.
+    public func setLegacyCameraFov(_ fov: CameraFov) throws -> CameraFovResult {
+        try DeviceManager.shared.sendLegacyCameraFovSetting(
+            fov: fov.fov,
+            roiPosition: fov.roiPosition.rawValue
+        )
+        return CameraFovResult(
+            requestId: "legacy",
+            fov: fov.fov,
+            roiPosition: fov.roiPosition,
+            timestamp: Int(Date().timeIntervalSince1970 * 1000)
+        )
+    }
+
+    /// Restores the persistent base FOV without requiring a settings acknowledgement.
+    public func restoreLegacyCameraFov() throws {
+        try DeviceManager.shared.restoreLegacyCameraFovSetting()
+    }
+
+    public func setCameraFovOverride(
+        leaseId: String,
+        fov: CameraFov,
+        ttlMs: Int
+    ) async throws -> CameraFovResult {
+        let ack = try await performSettingsCommand(
+            setting: "camera_fov_override",
+            updateStore: { _ in },
+            send: { requestId in
+                try DeviceManager.shared.sendCameraFovOverride(
+                    requestId: requestId,
+                    leaseId: leaseId,
+                    fov: fov.fov,
+                    roiPosition: fov.roiPosition.rawValue,
+                    ttlMs: ttlMs
+                )
+            }
+        )
+        return try CameraFovResult.from(ack: ack, fallback: fov)
+    }
+
+    public func releaseCameraFovOverride(leaseId: String) async throws -> SettingsAckEvent {
+        try await performSettingsCommand(
+            setting: "camera_fov_override",
+            updateStore: { _ in },
+            send: { requestId in
+                try DeviceManager.shared.releaseCameraFovOverride(
+                    requestId: requestId,
+                    leaseId: leaseId
+                )
+            }
+        )
+    }
+
+    public func setCameraTuningConfig(anrOn: Bool, gainOn: Bool) async throws -> SettingsAckEvent {
+        return try await performSettingsCommand(
+            setting: "camera_tuning",
+            updateStore: { _ in },
+            send: { requestId in
+                try DeviceManager.shared.sendCameraTuningConfig(
+                    requestId: requestId,
+                    anrOn: anrOn,
+                    gainOn: gainOn
+                )
+            }
+        )
+    }
+
+    public func setMicState(
+        enabled: Bool,
+        useGlassesMic: Bool = true,
+        sendTranscript: Bool = false,
+        sendLc3Data: Bool = false
+    ) {
+        if enabled {
+            DeviceStore.shared.apply(
+                ObservableStore.bluetoothCategory,
+                "preferred_mic",
+                useGlassesMic ? MicPreference.glasses.rawValue : MicPreference.phone.rawValue
+            )
+        }
+        applyMicState(
+            sendPcmData: enabled,
+            sendTranscript: enabled && sendTranscript,
+            sendLc3Data: enabled && sendLc3Data
+        )
+    }
+
+    private func applyMicState(
+        sendPcmData: Bool,
+        sendTranscript: Bool,
+        sendLc3Data: Bool
+    ) {
+        DeviceStore.shared.apply(ObservableStore.bluetoothCategory, "should_send_pcm", sendPcmData)
+        DeviceStore.shared.apply(ObservableStore.bluetoothCategory, "should_send_lc3", sendLc3Data)
+        DeviceStore.shared.apply(ObservableStore.bluetoothCategory, "should_send_transcript", sendTranscript)
+        DeviceManager.shared.setMicState()
+    }
+
+    public func setPreferredMic(_ preferredMic: MicPreference) {
+        DeviceStore.shared.apply(ObservableStore.bluetoothCategory, "preferred_mic", preferredMic.rawValue)
+    }
+
+    public func setOwnAppAudioPlaying(_ playing: Bool) {
+        PhoneAudioMonitor.getInstance().setOwnAppAudioPlaying(playing)
+    }
+
+    public func getGlassesMediaVolume() async throws -> GlassesMediaVolumeGetResult {
+        try GlassesMediaVolumeGetResult(values: await DeviceManager.shared.getGlassesMediaVolume())
+    }
+
+    public func setGlassesMediaVolume(_ level: Int) async throws -> GlassesMediaVolumeSetResult {
+        guard (0 ... 15).contains(level) else {
+            throw BluetoothSdkError(
+                code: "invalid_volume_level",
+                message: "Glasses media volume must be between 0 and 15."
+            )
+        }
+        return try GlassesMediaVolumeSetResult(values: await DeviceManager.shared.setGlassesMediaVolume(level: level))
+    }
+
+    public func requestWifiScan() async throws -> [WifiScanResult] {
+        if let existing = wifiScanTask {
+            // Join the in-flight scan instead of failing with request_in_flight;
+            // the scan screen auto-starts a scan on mount and can be pushed twice.
+            return try await existing.value
+        }
+        let pending = PendingResponse<[WifiScanResult]>(operation: "WiFi scan request", onTimeout: requestTimeoutReporter)
+        let request = PendingWifiScan(pending: pending, scanId: "scan-\(UUID().uuidString)")
+        pendingWifiScan = request
+        // Claim the scan-results store for this scan before the command goes out,
+        // so a delayed chunk from an older, abandoned scan can no longer mutate it.
+        Bridge.claimWifiScanResults(scanId: request.scanId)
+        DeviceManager.shared.requestWifiScan(scanId: request.scanId)
+        let task = Task { @MainActor [weak self] () async throws -> [WifiScanResult] in
+            defer {
+                if let self {
+                    if self.pendingWifiScan === request {
+                        self.pendingWifiScan = nil
+                    }
+                    self.wifiScanTask = nil
+                }
+            }
+            do {
+                // The glasses wait up to 15s for scan-results broadcasts before sending
+                // scan_complete, so give them longer than that before falling back.
+                return try await pending.wait(timeoutMs: MentraBluetoothSDK.wifiScanTimeoutMs)
+            } catch {
+                if (error as? BluetoothSdkError)?.code == "request_timeout",
+                   !request.latestResults.isEmpty
+                {
+                    return request.latestResults
+                }
+                throw error
+            }
+        }
+        wifiScanTask = task
+        return try await task.value
+    }
+
+    public func sendWifiCredentials(ssid: String, password: String) async throws -> WifiStatusEvent {
+        guard pendingWifiStatus == nil, pendingWifiForget == nil else {
+            throw BluetoothSdkError(
+                code: "request_in_flight",
+                message: "A WiFi status command is already waiting for a glasses response."
+            )
+        }
+        let pending = PendingResponse<WifiStatusEvent>(operation: "WiFi connect request", onTimeout: requestTimeoutReporter)
+        pendingWifiStatus = PendingWifiStatusRequest(ssid: ssid, pending: pending)
+        do {
+            let event = try await withUsageOutcome(record: { latencyMs, errorCode, _ in
+                analytics.recordUsage { $0.wifiSetupSettled(latencyMs: latencyMs, errorCode: errorCode) }
+            }) {
+                DeviceManager.shared.sendWifiCredentials(ssid, password)
+                return try await pending.wait()
+            }
+            if pendingWifiStatus?.pending === pending {
+                pendingWifiStatus = nil
+            }
+            return event
+        } catch {
+            if pendingWifiStatus?.pending === pending {
+                pendingWifiStatus = nil
+            }
+            throw error
+        }
+    }
+
+    public func forgetWifiNetwork(ssid: String) async throws -> WifiForgetResult {
+        guard wifiSsidIsValid(ssid) else {
+            throw BluetoothSdkError(code: "invalid_ssid", message: "WiFi SSID cannot be empty.")
+        }
+        guard pendingWifiStatus == nil, pendingWifiForget == nil else {
+            throw BluetoothSdkError(
+                code: "request_in_flight",
+                message: "A WiFi status command is already waiting for a glasses response."
+            )
+        }
+        let pending = PendingResponse<WifiForgetResult>(operation: "WiFi forget request", onTimeout: requestTimeoutReporter)
+        let requestId = "forget-\(UUID().uuidString)"
+        let request = PendingWifiForgetRequest(
+            ssid: ssid,
+            requestId: requestId,
+            sid: wifiSessionCapabilities.sessionId,
+            epoch: wifiSessionCapabilities.epoch,
+            pending: pending,
+            mode: wifiSessionCapabilities.forgetMode()
+        )
+        pendingWifiForget = request
+        dispatchWifiForgetIfReady(request)
+        do {
+            let event = try await pending.wait()
+            if pendingWifiForget === request {
+                pendingWifiForget = nil
+            }
+            return event
+        } catch {
+            if pendingWifiForget === request {
+                pendingWifiForget = nil
+            }
+            if let sdkError = error as? BluetoothSdkError, sdkError.code == "request_timeout", request.mode == .discovering {
+                throw BluetoothSdkError(code: wifiCapabilityNegotiationTimeoutCode, message: "WiFi capability negotiation timed out.")
+            }
+            throw error
+        }
+    }
+
+    public func getSavedWifiNetworks() async throws -> SavedWifiNetworksResult {
+        guard pendingSavedWifiNetworks == nil else {
+            throw BluetoothSdkError(
+                code: "request_in_flight",
+                message: "A saved WiFi networks request is already waiting for a glasses response."
+            )
+        }
+        let requestId = "saved-\(UUID().uuidString)"
+        let mode = wifiSessionCapabilities.savedNetworksMode()
+        if mode == .legacy || mode == .unsupported {
+            return SavedWifiNetworksResult(
+                outcome: .unsupported,
+                networks: [],
+                error: "saved_wifi_networks_unsupported"
+            )
+        }
+        let pending = PendingResponse<SavedWifiNetworksResult>(operation: "Saved WiFi networks request", onTimeout: requestTimeoutReporter)
+        let request = PendingSavedWifiNetworks(
+            requestId: requestId,
+            sid: wifiSessionCapabilities.sessionId,
+            epoch: wifiSessionCapabilities.epoch,
+            pending: pending,
+            mode: mode
+        )
+        pendingSavedWifiNetworks = request
+        dispatchSavedWifiNetworksIfReady(request)
+        do {
+            let networks = try await pending.wait()
+            if pendingSavedWifiNetworks === request {
+                pendingSavedWifiNetworks = nil
+            }
+            return networks
+        } catch {
+            if pendingSavedWifiNetworks === request {
+                pendingSavedWifiNetworks = nil
+            }
+            if let sdkError = error as? BluetoothSdkError, sdkError.code == "request_timeout", request.mode == .discovering {
+                throw BluetoothSdkError(code: wifiCapabilityNegotiationTimeoutCode, message: "WiFi capability negotiation timed out.")
+            }
+            throw error
+        }
+    }
+
+    public func setHotspotState(enabled: Bool) async throws -> HotspotStatusEvent {
+        let previous = hotspotTail
+        let task = Task { @MainActor [weak self] in
+            guard let self else {
+                throw BluetoothSdkError(code: "sdk_closed", message: "Bluetooth SDK is closed.")
+            }
+            if let previous {
+                _ = try? await previous.value
+            }
+            let pending = PendingResponse<HotspotStatusEvent>(
+                operation: "hotspot \(enabled ? "enable" : "disable") request",
+                onTimeout: self.requestTimeoutReporter
+            )
+            self.pendingHotspotStatus = PendingHotspotStatusRequest(enabled: enabled, pending: pending)
+            do {
+                let event = try await self.withUsageOutcome(record: { latencyMs, errorCode, _ in
+                    guard enabled else { return }
+                    self.analytics.recordUsage { $0.hotspotStartSettled(latencyMs: latencyMs, errorCode: errorCode) }
+                }) {
+                    DeviceManager.shared.setHotspotState(enabled)
+                    return try await pending.wait()
+                }
+                if self.pendingHotspotStatus?.pending === pending {
+                    self.pendingHotspotStatus = nil
+                }
+                return event
+            } catch {
+                if self.pendingHotspotStatus?.pending === pending {
+                    self.pendingHotspotStatus = nil
+                }
+                throw error
+            }
+        }
+        hotspotTail = task
+        return try await task.value
+    }
+
+    /// Fire-and-forget Mentra Live Wi-Fi ADB toggle. Glasses do not ack this
+    /// command, so there is no pending-response wait (unlike hotspot / Wi-Fi forget).
+    public func setWifiAdbState(enabled: Bool) async throws {
+        try await setWifiAdbState(enabled: enabled, expectedBluetoothMac: nil)
+    }
+
+    public func setWifiAdbState(enabled: Bool, expectedBluetoothMac: String?) async throws {
+        try requireGlassesConnected(operation: "toggle Wi-Fi ADB")
+        try DeviceManager.shared.setWifiAdbState(enabled, expectedBluetoothMac: expectedBluetoothMac)
+    }
+
+    func setSystemTime(timestampMs: Int64) {
+        DeviceManager.shared.setSystemTime(timestampMs)
+    }
+
+    public func requestPhoto(_ request: PhotoRequest) async throws -> PhotoResponseEvent {
+        let routedRequest = nonBlankRequestId(request.requestId).map { request.withRequestId($0) }
+            ?? request.withRequestId(generatedCameraRequestId("photo"))
+        Bridge.log(
+            "NATIVE: PHOTO PIPELINE [3b/6] MentraBluetoothSdk.requestPhoto requestId=\(routedRequest.requestId)"
+        )
+        let pending = PendingResponse<PhotoResponseEvent>(operation: "photo request \(routedRequest.requestId)", telemetryOperation: "photo request", onTimeout: requestTimeoutReporter)
+        pendingPhotoRequests[routedRequest.requestId] = pending
+        do {
+            let event = try await withUsageOutcome(record: { (latencyMs, errorCode, event: PhotoResponseEvent?) in
+                var fileSizeBytes: Int64?
+                if case let .success(_, _, _, _, _, size?, _) = event?.response { fileSizeBytes = Int64(size) }
+                analytics.recordUsage {
+                    $0.photoSettled(
+                        size: routedRequest.size.rawValue,
+                        mode: routedRequest.mode.rawValue,
+                        compress: routedRequest.compress.rawValue,
+                        save: routedRequest.save,
+                        transferMethod: routedRequest.transferMethod,
+                        latencyMs: latencyMs,
+                        fileSizeBytes: fileSizeBytes,
+                        errorCode: errorCode
+                    )
+                }
+            }) {
+                DeviceManager.shared.requestPhoto(routedRequest)
+                return try await pending.wait(timeoutMs: routedRequest.presendThumbnail
+                    ? MentraBluetoothSDK.photoThumbnailRequestTimeoutMs
+                    : MentraBluetoothSDK.photoRequestTimeoutMs)
+            }
+            pendingPhotoRequests.removeValue(forKey: routedRequest.requestId)
+            return event
+        } catch {
+            pendingPhotoRequests.removeValue(forKey: routedRequest.requestId)
+            throw error
+        }
+    }
+
+    public func warmUpCamera(
+        requestId: String? = nil,
+        size: PhotoSize,
+        mode: PhotoMode = .photo,
+        exposureTimeNs: Double?,
+        durationMs: Int,
+        zsl: Bool? = nil,
+        mfnr: Bool? = nil
+    ) async throws -> CameraStatusEvent {
+        let effectiveRequestId = nonBlankRequestId(requestId) ?? generatedCameraRequestId("warm")
+        let pending = PendingResponse<CameraStatusEvent>(operation: "camera warm up \(effectiveRequestId)", telemetryOperation: "camera warm up", onTimeout: requestTimeoutReporter)
+        pendingCameraStatusRequests[effectiveRequestId] = pending
+        do {
+            // Inside the catch so an unsupported-device throw also clears the pending entry.
+            try DeviceManager.shared.warmUpCamera(
+                requestId: effectiveRequestId,
+                size: size,
+                mode: mode,
+                exposureTimeNs: exposureTimeNs,
+                durationMs: durationMs,
+                zsl: zsl,
+                mfnr: mfnr
+            )
+            let event = try await pending.wait()
+            pendingCameraStatusRequests.removeValue(forKey: effectiveRequestId)
+            return event
+        } catch {
+            pendingCameraStatusRequests.removeValue(forKey: effectiveRequestId)
+            throw error
+        }
+    }
+
+    public func stopCameraWarmUp(requestId: String) throws {
+        guard let effectiveRequestId = nonBlankRequestId(requestId) else {
+            throw BluetoothSdkError(
+                code: "invalid_request", message: "A warm-up request ID is required."
+            )
+        }
+        try DeviceManager.shared.stopCameraWarmUp(requestId: effectiveRequestId)
+    }
+
+    public func queryGalleryStatus() async throws -> GalleryStatusEvent {
+        if pendingGalleryStatus != nil {
+            throw BluetoothSdkError(
+                code: "request_in_flight",
+                message: "A gallery status query is already waiting for a glasses response."
+            )
+        }
+        let pending = PendingResponse<GalleryStatusEvent>(operation: "gallery status query", onTimeout: requestTimeoutReporter)
+        pendingGalleryStatus = pending
+        DeviceManager.shared.queryGalleryStatus()
+        do {
+            let event = try await pending.wait()
+            if pendingGalleryStatus === pending {
+                pendingGalleryStatus = nil
+            }
+            return event
+        } catch {
+            if pendingGalleryStatus === pending {
+                pendingGalleryStatus = nil
+            }
+            throw error
+        }
+    }
+
+    public func startStream(_ request: StreamRequest) async throws -> StreamStatusEvent {
+        var values = request.values
+        let streamId = stringValue(values, "streamId").flatMap { $0.isEmpty ? nil : $0 } ?? "sdk-\(UUID().uuidString)"
+        values["streamId"] = streamId
+        let message = values
+        return try await withUsageOutcome(record: { latencyMs, errorCode, _ in
+            let glassesNetwork = glassesNetwork()
+            analytics.recordUsage {
+                $0.streamStartSettled(
+                    streamUrl: request.streamUrl,
+                    width: request.video?.width,
+                    height: request.video?.height,
+                    fps: request.video?.fps,
+                    bitrate: request.video?.bitrate,
+                    captureAudio: request.captureAudio,
+                    glassesNetwork: glassesNetwork,
+                    latencyMs: latencyMs,
+                    errorCode: errorCode
+                )
+            }
+        }) {
+            try requireGlassesConnected(operation: "start stream")
+            guard streamSession.supported else {
+                throw BluetoothSdkError(code: "stream_control_unsupported", message: "Update the glasses software before starting a stream.")
+            }
+            let pending = PendingResponse<StreamStatusEvent>(operation: "start stream \(streamId)", telemetryOperation: "start stream", onTimeout: requestTimeoutReporter)
+            let requestedAt = BluetoothSdkAnalytics.epochMillis()
+            analytics.recordUsage { $0.streamRequested(streamId: streamId, streamUrl: request.streamUrl, nowMs: requestedAt) }
+            // seq assignment through the BLE hand-off must stay await-free so this
+            // MainActor turn is one critical section: rejectPreemptedStreamStarts
+            // only works if seq order equals the order the commands reach the
+            // glasses' FIFO.
+            streamStartSeq += 1
+            pendingStreamStarts[streamId] = PendingStreamStart(seq: streamStartSeq, pending: pending)
+            DeviceManager.shared.startStream(message)
+            do {
+                let event = try await pending.wait(timeoutMs: 30000)
+                pendingStreamStarts.removeValue(forKey: streamId)
+                return event
+            } catch {
+                pendingStreamStarts.removeValue(forKey: streamId)
+                throw error
+            }
+        }
+    }
+
+    public func rgbLedControl(_ request: RgbLedRequest) async throws -> RgbLedControlResponseEvent {
+        let pending = PendingResponse<RgbLedControlResponseEvent>(operation: "RGB LED command \(request.requestId)", telemetryOperation: "RGB LED command", onTimeout: requestTimeoutReporter)
+        pendingRgbLedRequests[request.requestId] = pending
+        DeviceManager.shared.rgbLedControl(
+            requestId: request.requestId,
+            packageName: request.packageName,
+            action: request.action.rawValue,
+            color: request.color?.rawValue,
+            onDurationMs: request.onDurationMs,
+            offDurationMs: request.offDurationMs,
+            count: request.count
+        )
+        do {
+            let event = try await pending.wait()
+            pendingRgbLedRequests.removeValue(forKey: request.requestId)
+            return event
+        } catch {
+            pendingRgbLedRequests.removeValue(forKey: request.requestId)
+            throw error
+        }
+    }
+
+    public func stopStream() async throws -> StreamStatusEvent {
+        analytics.updateUsage { $0.streamStopRequested() }
+        guard pendingStreamStop == nil else {
+            throw BluetoothSdkError(
+                code: "request_in_flight",
+                message: "A stream stop command is already waiting for a glasses response."
+            )
+        }
+        let pending = PendingResponse<StreamStatusEvent>(operation: "stop stream", onTimeout: requestTimeoutReporter)
+        // The seq draw and the BLE hand-off stay in this single await-free
+        // MainActor turn, sharing startStream's ordering critical section:
+        // the stop takes its own slot in the send order, so its ack can
+        // separate the pending starts the glasses consumed before it (lower
+        // seq) from starts sent after it (higher seq).
+        streamStartSeq += 1
+        pendingStreamStop = (streamId: streamSession.currentStreamId, seq: streamStartSeq, pending: pending)
+        DeviceManager.shared.stopStream()
+        do {
+            let event = try await pending.wait(timeoutMs: 15000)
+            if pendingStreamStop?.pending === pending {
+                pendingStreamStop = nil
+            }
+            return event
+        } catch {
+            if pendingStreamStop?.pending === pending {
+                pendingStreamStop = nil
+            }
+            throw error
+        }
+    }
+
+    public func startVideoRecording(_ request: VideoRecordingRequest) async throws -> VideoRecordingStatusEvent {
+        guard !request.requestId.isEmpty else {
+            throw BluetoothSdkError(code: "missing_request_id", message: "requestId is required to start video recording.")
+        }
+        try requireGlassesConnected(operation: "start video recording")
+        let pending = PendingResponse<VideoRecordingStatusEvent>(
+            operation: "start video recording \(request.requestId)",
+            telemetryOperation: "start video recording",
+            onTimeout: requestTimeoutReporter
+        )
+        guard pendingVideoRecordingRequests[request.requestId] == nil else {
+            throw BluetoothSdkError(
+                code: "request_in_flight",
+                message: "A video recording command is already waiting for requestId \(request.requestId)."
+            )
+        }
+        pendingVideoRecordingRequests[request.requestId] = PendingVideoRecordingRequest(
+            expectedStatus: "recording_started",
+            pending: pending
+        )
+        analytics.updateUsage {
+            $0.videoRequested(
+                requestId: request.requestId,
+                width: request.width,
+                height: request.height,
+                fps: request.fps,
+                save: request.save,
+                maxDurationMinutes: request.maxRecordingTimeMinutes
+            )
+        }
+        DeviceManager.shared.startVideoRecording(
+            request.requestId,
+            request.save,
+            request.sound,
+            request.width,
+            request.height,
+            request.fps,
+            request.maxRecordingTimeMinutes
+        )
+        do {
+            let event = try await pending.wait()
+            pendingVideoRecordingRequests.removeValue(forKey: request.requestId)
+            return event
+        } catch {
+            pendingVideoRecordingRequests.removeValue(forKey: request.requestId)
+            throw error
+        }
+    }
+
+    public func stopVideoRecording(
+        requestId: String, webhookUrl: String? = nil, authToken: String? = nil
+    ) async throws -> VideoRecordingStatusEvent {
+        guard !requestId.isEmpty else {
+            throw BluetoothSdkError(code: "missing_request_id", message: "requestId is required to stop video recording.")
+        }
+        try requireGlassesConnected(operation: "stop video recording")
+        let pending = PendingResponse<VideoRecordingStatusEvent>(operation: "stop video recording \(requestId)", telemetryOperation: "stop video recording", onTimeout: requestTimeoutReporter)
+        guard pendingVideoRecordingRequests[requestId] == nil else {
+            throw BluetoothSdkError(
+                code: "request_in_flight",
+                message: "A video recording command is already waiting for requestId \(requestId)."
+            )
+        }
+        let waitForUpload = !(webhookUrl?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+        pendingVideoRecordingRequests[requestId] = PendingVideoRecordingRequest(
+            expectedStatus: "recording_stopped",
+            pending: pending,
+            waitForUpload: waitForUpload
+        )
+        analytics.updateUsage { $0.videoStopRequested(requestId: requestId) }
+        DeviceManager.shared.stopVideoRecording(requestId, webhookUrl, authToken)
+        do {
+            let timeoutMs = waitForUpload ? videoUploadStopTimeoutMs : 15000
+            let event = try await pending.wait(timeoutMs: timeoutMs)
+            pendingVideoRecordingRequests.removeValue(forKey: requestId)
+            return event
+        } catch {
+            pendingVideoRecordingRequests.removeValue(forKey: requestId)
+            throw error
+        }
+    }
+
+    public func queryVideoRecordingStatus(requestId: String) async throws -> VideoRecordingStatusEvent {
+        guard !requestId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw BluetoothSdkError(
+                code: "missing_request_id",
+                message: "requestId is required to query video recording status."
+            )
+        }
+        try requireGlassesConnected(operation: "query video recording status")
+        let pending = PendingResponse<VideoRecordingStatusEvent>(operation: "query video recording status \(requestId)", telemetryOperation: "query video recording status", onTimeout: requestTimeoutReporter)
+        guard pendingVideoRecordingRequests[requestId] == nil else {
+            throw BluetoothSdkError(
+                code: "request_in_flight",
+                message: "A video recording command is already waiting for requestId \(requestId)."
+            )
+        }
+        pendingVideoRecordingRequests[requestId] = PendingVideoRecordingRequest(
+            expectedStatus: "recording_status",
+            pending: pending
+        )
+        DeviceManager.shared.queryVideoRecordingStatus(requestId)
+        do {
+            let event = try await pending.wait()
+            pendingVideoRecordingRequests.removeValue(forKey: requestId)
+            return event
+        } catch {
+            pendingVideoRecordingRequests.removeValue(forKey: requestId)
+            throw error
+        }
+    }
+
+    public func requestVersionInfo() async throws -> VersionInfoResult {
+        if let request = pendingVersionInfo {
+            logVersionInfoRequest(request, stage: "refused", extra: ["code": "request_in_flight"])
+            throw BluetoothSdkError(
+                code: "request_in_flight",
+                message: "A version info request is already waiting for a glasses response."
+            )
+        }
+        let requestId = UUID().uuidString
+        let pending = PendingResponse<VersionInfoResult>(operation: "version info request", onTimeout: requestTimeoutReporter)
+        let request = PendingVersionInfoRequest(pending: pending, requestId: requestId)
+        pendingVersionInfo = request
+        logVersionInfoRequest(request, stage: "registered")
+        DeviceManager.shared.requestVersionInfo(requestId: requestId)
+        do {
+            let status = try await pending.wait()
+            if pendingVersionInfo === request {
+                pendingVersionInfo = nil
+            }
+            logVersionInfoRequest(request, stage: "resolved")
+            return status
+        } catch {
+            if pendingVersionInfo === request {
+                pendingVersionInfo = nil
+            }
+            let sdkError = error as? BluetoothSdkError
+            logVersionInfoRequest(request, stage: "rejected", extra: [
+                "code": sdkError?.code ?? String((error as NSError).code),
+                "message": String((sdkError?.message ?? error.localizedDescription).prefix(256)),
+            ])
+            throw error
+        }
+    }
+
+    /// Select the HTTP(S) manifest used by subsequent OTA checks and installs.
+    public func setOtaVersionUrl(_ otaVersionUrl: String) throws {
+        configuredOtaVersionUrl = try OtaManifestChecker.normalizeHttpUrl(otaVersionUrl)
+    }
+
+    /// Return the configured OTA manifest, or this SDK release's default manifest.
+    public func getOtaVersionUrl() throws -> String {
+        try configuredOtaVersionUrl ?? OtaManifestDefaults.defaultOtaVersionUrl()
+    }
+
+    /// Fetch the configured OTA manifest and return whether any ASG/BES/MTK update is available.
+    public func checkForOtaUpdate() async throws -> Bool {
+        let status = await getFreshGlassesStatus()
+        guard status.connected else {
+            throw BluetoothSdkError(
+                code: "glasses_not_connected",
+                message: "Cannot check OTA update because glasses are not connected."
+            )
+        }
+        guard !status.buildNumber.isEmpty else {
+            throw BluetoothSdkError(
+                code: "missing_glasses_version",
+                message: "Cannot check OTA update because glasses build number is unavailable."
+            )
+        }
+        // A sideloaded client installs under its own package and coexists with the stock system
+        // app, so its build number is not comparable to the manifest pin and installing the
+        // manifest's APK would not replace it. Refuse rather than answer about the wrong client.
+        // Empty means the glasses predate the field: assume stock and keep existing behavior.
+        guard status.packageName.isEmpty || status.packageName == OtaManifestChecker.asgClientPackage else {
+            throw BluetoothSdkError(
+                code: "unofficial_client",
+                message: "Cannot check OTA update because the glasses run an unofficial client "
+                    + "(\(status.packageName))."
+            )
+        }
+
+        let manifestUrl = try resolveOtaVersionUrl(status: status)
+        let manifest = try await OtaManifestChecker.fetch(manifestUrl)
+        let otaStatus = try await waitForOtaManifestStatus(status, manifest: manifest)
+        if try OtaManifestChecker.hasUpdate(
+            currentBuildNumber: otaStatus.buildNumber,
+            currentMtkVersion: otaStatus.mtkFirmwareVersion,
+            currentBesVersion: otaStatus.besFirmwareVersion,
+            manifest: manifest
+        ) {
+            return true
+        }
+        return await OtaManifestChecker.hasMtkDowngrade(manifest: manifest, currentVersion: otaStatus.mtkFirmwareVersion)
+    }
+
+    /// Return bundled release changelogs crossed between two coordinated product versions, newest first.
+    public func getReleaseChangelogs(
+        fromVersion: String? = nil,
+        toVersion: String? = nil
+    ) throws -> [ReleaseChangelog] {
+        try ReleaseChangelogCatalog.select(fromVersion: fromVersion, toVersion: toVersion)
+    }
+
+    /// Ask connected Mentra Live glasses to report the current OTA install/session status.
+    private func queryOtaStatus() async throws -> OtaQueryResult {
+        try await performOtaQuery(operation: "OTA status query") {
+            DeviceManager.shared.sendOtaQueryStatus()
+        }
+    }
+
+    private func performOtaQuery(
+        operation: String,
+        sendRequest: () -> Void
+    ) async throws -> OtaQueryResult {
+        if pendingOtaQuery != nil {
+            throw BluetoothSdkError(
+                code: "request_in_flight",
+                message: "An OTA status query is already waiting for a glasses response."
+            )
+        }
+        let pending = PendingResponse<OtaQueryResult>(operation: operation, onTimeout: requestTimeoutReporter)
+        pendingOtaQuery = pending
+        sendRequest()
+        do {
+            let result = try await pending.wait()
+            if pendingOtaQuery === pending {
+                pendingOtaQuery = nil
+            }
+            return result
+        } catch {
+            if pendingOtaQuery === pending {
+                pendingOtaQuery = nil
+            }
+            throw error
+        }
+    }
+
+    /// Start the OTA flow after your app has presented the available update to the user.
+    public func startOtaUpdate() async throws -> OtaStartAckEvent {
+        let status = await getFreshGlassesStatus()
+        let otaVersionUrl = try resolveOtaVersionUrl(status: status)
+        return try await startOtaUpdate(otaVersionUrl: otaVersionUrl)
+    }
+
+    private func startOtaCommand(otaVersionUrl: String) async throws -> OtaStartAckEvent {
+        if pendingOtaStart != nil {
+            throw BluetoothSdkError(
+                code: "request_in_flight",
+                message: "An OTA start command is already waiting for a glasses response."
+            )
+        }
+        let pending = PendingResponse<OtaStartAckEvent>(operation: "OTA start command", onTimeout: requestTimeoutReporter)
+        pendingOtaStart = pending
+        DeviceManager.shared.sendOtaStart(otaVersionUrl: otaVersionUrl)
+        do {
+            let event = try await pending.wait()
+            if pendingOtaStart === pending {
+                pendingOtaStart = nil
+            }
+            return event
+        } catch {
+            if pendingOtaStart === pending {
+                pendingOtaStart = nil
+            }
+            throw error
+        }
+    }
+
+    func startOtaUpdate(otaVersionUrl: String) async throws -> OtaStartAckEvent {
+        try await startOtaCommand(otaVersionUrl: otaVersionUrl)
+    }
+
+    func sendOtaQueryStatus() async throws -> OtaQueryResult {
+        try await queryOtaStatus()
+    }
+
+    func startAr99OtaFromFile(_ path: String) throws -> Bool {
+        try requireGlassesConnected(operation: "start AR99 OTA")
+        return try DeviceManager.shared.startAr99OtaFromFile(path)
+    }
+
+    func cancelAr99Ota() {
+        DeviceManager.shared.cancelAr99Ota()
+    }
+
+    func sendAr99FactoryReset() throws {
+        try requireGlassesConnected(operation: "factory reset AR99")
+        try DeviceManager.shared.sendAr99FactoryReset()
+    }
+
+    private func getFreshGlassesStatus() async -> GlassesStatus {
+        let status = glassesStatus
+        if !status.connected || !status.buildNumber.isEmpty {
+            return status
+        }
+
+        do {
+            let versionInfo = try await requestVersionInfo()
+            let values = status.values.merging(versionInfo.dictionary) { existing, new in
+                if let newString = new as? String, newString.isEmpty {
+                    return existing
+                }
+                return new
+            }
+            return GlassesStatus(values: values)
+        } catch {
+            return status
+        }
+    }
+
+    private func waitForOtaManifestStatus(_ initialStatus: GlassesStatus, manifest: OtaManifest) async throws -> GlassesStatus {
+        var status = initialStatus
+        if OtaManifestChecker.hasBesFirmware(manifest), status.besFirmwareVersion.isEmpty {
+            status = await waitForGlassesStatus(status, timeoutMs: Self.otaBesVersionWaitMs) {
+                !$0.connected || !$0.besFirmwareVersion.isEmpty
+            }
+        }
+
+        if OtaManifestChecker.hasMtkPatches(manifest), status.mtkFirmwareVersion.isEmpty {
+            status = await waitForGlassesStatus(status, timeoutMs: Self.otaMtkVersionWaitMs) {
+                !$0.connected || !$0.mtkFirmwareVersion.isEmpty
+            }
+        }
+
+        guard status.connected else {
+            throw BluetoothSdkError(
+                code: "glasses_not_connected",
+                message: "Cannot check OTA update because glasses disconnected."
+            )
+        }
+        return status
+    }
+
+    private func waitForGlassesStatus(
+        _ initialStatus: GlassesStatus,
+        timeoutMs: Int,
+        isReady: (GlassesStatus) -> Bool
+    ) async -> GlassesStatus {
+        let deadline = Date().addingTimeInterval(Double(timeoutMs) / 1000)
+        var status = initialStatus
+        while Date() < deadline {
+            status = glassesStatus
+            if isReady(status) {
+                return status
+            }
+
+            let remainingMs = max(0, Int(deadline.timeIntervalSinceNow * 1000))
+            let sleepMs = min(Self.otaVersionPollMs, remainingMs)
+            if sleepMs <= 0 {
+                break
+            }
+            try? await Task.sleep(nanoseconds: UInt64(sleepMs) * 1_000_000)
+        }
+        return glassesStatus
+    }
+
+    private func resolveOtaVersionUrl(status: GlassesStatus) throws -> String {
+        let deviceUrl = status.otaVersionUrl.trimmingCharacters(in: .whitespacesAndNewlines)
+        if isLegacyAsgOtaStartBuild(status.buildNumber) {
+            return OtaManifestDefaults.legacyProdOtaVersionUrl
+        }
+        // SDK consumers are pinned to the manifest built for their SDK version.
+        // A future glasses-advertised URL should not silently change that pairing.
+        if let configuredOtaVersionUrl {
+            return configuredOtaVersionUrl
+        }
+        return try OtaManifestDefaults.defaultOtaVersionUrl()
+    }
+
+    private func isLegacyAsgOtaStartBuild(_ buildNumber: String) -> Bool {
+        guard let parsed = Int(buildNumber) else { return false }
+        return parsed < 39
+    }
+
+    func sendShutdown() {
+        DeviceManager.shared.sendShutdown()
+    }
+
+    func sendReboot() {
+        DeviceManager.shared.sendReboot()
+    }
+
+    func sendIncidentId(_ incidentId: String, apiBaseUrl: String? = nil) throws {
+        try DeviceManager.shared.sendIncidentId(incidentId, apiBaseUrl: apiBaseUrl)
+    }
+
+    /// Resolves on the glasses' matching `ok:true` ack; throws on `ok:false`, disconnect or timeout.
+    func sendBesCrashReported(incidentKey: String, reportId: String) async throws {
+        try requireGlassesConnected(operation: "report the BES crash")
+        try await besCrashReports.report(
+            incidentKey: incidentKey,
+            reportId: reportId,
+            timeoutMs: Self.besCrashReportedTimeoutMs
+        ) {
+            try DeviceManager.shared.sendBesCrashReported(incidentKey: incidentKey, reportId: reportId)
+        }
+    }
+
+    public func invalidate() {
+        resetWifiProtocolSession(sessionId: "", code: "sdk_closed")
+        if let bluetoothAvailabilityListenerId {
+            BluetoothAvailability.shared.removeStateListener(bluetoothAvailabilityListenerId)
+            self.bluetoothAvailabilityListenerId = nil
+        }
+        if let bridgeEventSinkId {
+            Bridge.removeEventSink(bridgeEventSinkId)
+            self.bridgeEventSinkId = nil
+        }
+        if let storeListenerId {
+            DeviceStore.shared.store.removeListener(storeListenerId)
+            self.storeListenerId = nil
+        }
+        updateCheck?.stop()
+        delegate = nil
+    }
+
+    private func handleBluetoothAvailability(_ state: CBManagerState) {
+        switch state {
+        case .poweredOff, .resetting, .unauthorized, .unsupported:
+            handleBluetoothUnavailable()
+        case .poweredOn:
+            handleBluetoothRestored()
+        case .unknown:
+            break
+        @unknown default:
+            handleBluetoothUnavailable()
+        }
+    }
+
+    private func handleBluetoothUnavailable() {
+        cancelActiveScanSessions(reason: .cancelled)
+        clearBluetoothDiscoveryState()
+        disconnectActiveConnections()
+    }
+
+    private func disconnectActiveConnections() {
+        if glassesStatus.controllerConnected {
+            DeviceManager.shared.disconnectController()
+            shouldRestoreControllerOnBluetoothRestore = true
+        }
+        if glassesStatus.deviceModel == DeviceTypes.SIMULATED
+            || DeviceManager.shared.sgc?.type.contains(DeviceTypes.SIMULATED) == true
+        {
+            return
+        }
+        if glassesStatus.connected || glassesStatus.connectionState != .disconnected {
+            DeviceManager.shared.disconnect()
+            shouldRestoreGlassesOnBluetoothRestore = true
+        }
+    }
+
+    /// Reconnect only what `handleBluetoothUnavailable` tore down, never a
+    /// connection the user closed themselves (explicit connect/disconnect
+    /// calls clear the restore intent).
+    private func handleBluetoothRestored() {
+        let restoreGlasses = shouldRestoreGlassesOnBluetoothRestore
+        let restoreController = shouldRestoreControllerOnBluetoothRestore
+        clearBluetoothRestoreIntent()
+
+        if restoreGlasses, !glassesStatus.connected, glassesStatus.connectionState == .disconnected {
+            DeviceManager.shared.connectDefault(
+                requiresAncs: requiresAncsForBluetoothRestore
+            ) // also restores the controller
+        } else if restoreController, !glassesStatus.controllerConnected {
+            DeviceManager.shared.connectDefaultController()
+        }
+    }
+
+    private func clearBluetoothRestoreIntent() {
+        shouldRestoreGlassesOnBluetoothRestore = false
+        shouldRestoreControllerOnBluetoothRestore = false
+    }
+
+    private func clearBluetoothDiscoveryState() {
+        discoveredDeviceNames.removeAll()
+        DeviceStore.shared.apply(ObservableStore.bluetoothCategory, "searching", false)
+        DeviceStore.shared.apply(ObservableStore.bluetoothCategory, "searchingController", false)
+        DeviceStore.shared.apply(ObservableStore.bluetoothCategory, "searchResults", [] as [[String: Any]])
+    }
+
+    private func cancelActiveScanSessions(reason: ScanStopReason) {
+        let ids = Array(activeScanSessions.keys)
+        guard !ids.isEmpty else {
+            if bluetoothStatus.searching || bluetoothStatus.searchingController {
+                stopScan(reason: reason)
+            }
+            return
+        }
+        for (index, id) in ids.enumerated() {
+            // Stop the underlying scan once (first session); the rest only
+            // complete their callbacks.
+            finishScanSession(id, reason: reason, shouldStopScan: index == 0)
+        }
+    }
+
+    private func handleStreamStatusForRequests(_ event: StreamStatusEvent) {
+        if let (streamId, start) = matchingStreamStart(for: event) {
+            // Preemption is only proven by statuses the start path emits after
+            // the glasses' stopAllServices has run: initializing, reconnecting,
+            // reconnected, streaming. An id-stamped `error` can be a
+            // command-level preflight rejection (#3488 firmware) emitted
+            // synchronously before stopAllServices, and `stopped` is a
+            // stop-ack for a previous stream — treating either as a winner
+            // could reject an older start that is still healthy.
+            if let eventStreamId = event.streamId, !eventStreamId.isEmpty {
+                switch event.state {
+                case .initializing, .reconnecting, .reconnected, .streaming:
+                    rejectPreemptedStreamStarts(winnerSeq: start.seq)
+                default:
+                    break
+                }
+            }
+            switch event.state {
+            // `reconnected` also proves the stream is live: when an async start
+            // failure triggers the glasses' publisher retry, a successful retry
+            // reports `reconnected` instead of `streaming`.
+            case .streaming, .reconnected:
+                pendingStreamStarts.removeValue(forKey: streamId)
+                start.pending.resolve(event)
+            case .reconnectFailed, .stopped:
+                pendingStreamStarts.removeValue(forKey: streamId)
+                start.pending.reject(streamStatusError(start.lastError ?? event, code: "stream_start_failed"))
+            case .error:
+                if let eventStreamId = event.streamId, !eventStreamId.isEmpty, event.willRetry == true {
+                    // The glasses flag errors their publisher will retry with
+                    // `willRetry` (emitting side lands in PR #3488), so keep the
+                    // start pending for the retry's verdict — `reconnected` or
+                    // `streaming` on success, `reconnect_failed` or the
+                    // streamId-less `stopped` wind-down (which reports these
+                    // stashed details) on failure.
+                    start.lastError = event
+                } else {
+                    // An id-less error is the glasses' command-level rejection
+                    // (missing URL, low battery, no WiFi) emitted before any
+                    // publisher starts; an id-carrying error without `willRetry`
+                    // is terminal (`camera_busy` emits an error and nothing else).
+                    // Old firmware never sends `willRetry`, so its errors always
+                    // fail fast here — the shipped pre-#3487 Android behavior.
+                    pendingStreamStarts.removeValue(forKey: streamId)
+                    start.pending.reject(streamStatusError(event, code: "stream_start_failed"))
+                }
+            default:
+                break
+            }
+        }
+
+        if let stop = pendingStreamStop, streamStatus(event, matches: stop.streamId) {
+            if isAlreadyStoppedStreamStatus(event) {
+                if pendingStreamStop?.pending === stop.pending {
+                    pendingStreamStop = nil
+                }
+                rejectStreamStartsSuperseded(byStopSeq: stop.seq)
+                stop.pending.resolve(stoppedStreamEvent(from: event, fallbackStreamId: stop.streamId))
+            } else if event.state == .error || event.state == .reconnectFailed {
+                if pendingStreamStop?.pending === stop.pending {
+                    pendingStreamStop = nil
+                }
+                stop.pending.reject(streamStatusError(event, code: "stream_stop_failed"))
+            }
+        }
+    }
+
+    /// The glasses process BLE commands FIFO and every start_stream begins by
+    /// stopping whatever runs, so an id-carrying status proving start X's
+    /// start path ran on the glasses also proves every lower-seq start has
+    /// already been preempted. Their only verdict on current firmware is a
+    /// streamId-less stopped, which the id-less heuristic deliberately
+    /// ignores — without this they would run out the 30s timeout instead of
+    /// failing fast.
+    private func rejectPreemptedStreamStarts(winnerSeq: Int) {
+        for (streamId, start) in pendingStreamStarts where start.seq < winnerSeq {
+            pendingStreamStarts.removeValue(forKey: streamId)
+            start.pending.reject(
+                BluetoothSdkError(
+                    code: "stream_preempted",
+                    message: "start stream \(streamId) was preempted by a newer start_stream; "
+                        + "the glasses run a single stream and the last request wins."
+                )
+            )
+        }
+    }
+
+    /// The glasses process BLE commands FIFO, so this stop's ack also settles
+    /// every start sent before it: whatever those starts brought up (or would
+    /// have brought up) has been stopped, and no further status will arrive
+    /// for them. Without this they would run out the 30s start timeout.
+    /// Starts sent after the stop keep waiting for their own statuses.
+    private func rejectStreamStartsSuperseded(byStopSeq stopSeq: Int) {
+        for (streamId, start) in pendingStreamStarts where start.seq < stopSeq {
+            pendingStreamStarts.removeValue(forKey: streamId)
+            start.pending.reject(
+                BluetoothSdkError(
+                    code: "stream_stopped",
+                    message: "start stream \(streamId) was superseded by a stop_stream issued after it."
+                )
+            )
+        }
+    }
+
+    private func matchingStreamStart(for event: StreamStatusEvent) -> (String, PendingStreamStart)? {
+        if let streamId = event.streamId, !streamId.isEmpty {
+            guard let start = pendingStreamStarts[streamId] else { return nil }
+            return (streamId, start)
+        }
+        if event.state == .error {
+            // An id-less error is a command-level preflight rejection (missing
+            // URL, low battery, no WiFi) emitted synchronously, while lifecycle
+            // statuses arrive async — so with overlapping starts the wire is
+            // genuinely ambiguous about which start it answers. Attribute it to
+            // the newest pending start: the common case is a later start
+            // failing preflight while an earlier one is already emitting
+            // lifecycle statuses, and at worst this swaps which start carries
+            // the error instead of letting both time out.
+            guard let entry = pendingStreamStarts.max(by: { $0.value.seq < $1.value.seq }) else { return nil }
+            return (entry.key, entry.value)
+        }
+        if pendingStreamStarts.count == 1, let entry = pendingStreamStarts.first {
+            // A streamId-less STOPPED is the glasses' stop-ack for a PREVIOUS
+            // stream (their stop ack carries no streamId), not a verdict on the
+            // pending start — a start_stream that replaces a running publisher
+            // emits exactly this sequence (stopped -> initializing -> streaming).
+            // Attributing it here would reject a start that is about to succeed.
+            // After a stashed `willRetry` error for the pending start, though,
+            // the stopped is the retrying publisher's wind-down (the stop-ack
+            // always precedes any status for the new start), so it is that
+            // start's verdict.
+            if event.state == .stopped, entry.value.lastError == nil {
+                return nil
+            }
+            return (entry.key, entry.value)
+        }
+        return nil
+    }
+
+    private func streamStatus(_ event: StreamStatusEvent, matches streamId: String?) -> Bool {
+        guard let streamId, !streamId.isEmpty else { return true }
+        guard let eventStreamId = event.streamId, !eventStreamId.isEmpty else { return true }
+        return eventStreamId == streamId
+    }
+
+    private func isAlreadyStoppedStreamStatus(_ event: StreamStatusEvent) -> Bool {
+        if event.state == .stopped {
+            return true
+        }
+        guard case let .error(_, errorDetails, _, _) = event.status else {
+            return false
+        }
+        return ["not_streaming", "already_stopped", "not streaming"].contains(errorDetails.lowercased())
+    }
+
+    private func stoppedStreamEvent(from event: StreamStatusEvent, fallbackStreamId: String?) -> StreamStatusEvent {
+        StreamStatusEvent(
+            status: .lifecycle(
+                state: .stopped,
+                streamId: event.streamId ?? fallbackStreamId,
+                timestamp: event.status.timestamp ?? Int(Date().timeIntervalSince1970 * 1000),
+                resolvedConfig: event.resolvedConfig
+            )
+        )
+    }
+
+    private func streamStatusError(_ event: StreamStatusEvent, code: String) -> BluetoothSdkError {
+        let message: String
+        if case let .error(_, errorDetails, _, _) = event.status {
+            message = errorDetails
+        } else {
+            message = "Stream status \(event.state.rawValue)"
+        }
+        return BluetoothSdkError(code: code, message: message)
+    }
+
+    private func handlePhotoResponseForRequests(_ event: PhotoResponseEvent) {
+        guard let pending = pendingPhotoRequests[event.requestId] else { return }
+        switch event.response {
+        case .success:
+            pending.resolve(event)
+        case let .error(_, errorCode, errorMessage, _):
+            pending.reject(
+                BluetoothSdkError(
+                    code: errorCode ?? "photo_request_failed",
+                    message: errorMessage
+                )
+            )
+        }
+    }
+
+    private func handleCameraStatusForRequests(_ event: CameraStatusEvent) {
+        guard let pending = pendingCameraStatusRequests[event.requestId] else { return }
+        switch event.state.lowercased() {
+        case "ready":
+            pending.resolve(event)
+        case "error":
+            pending.reject(
+                BluetoothSdkError(
+                    code: event.errorCode ?? "camera_warm_up_failed",
+                    message: event.errorMessage ?? "Camera warm-up failed."
+                )
+            )
+        default:
+            // "warming"/"stopped" are progress updates; leave the pending promise alone.
+            break
+        }
+    }
+
+    private func handleVideoRecordingStatusForRequests(_ event: VideoRecordingStatusEvent) {
+        guard let request = pendingVideoRecordingRequests[event.requestId] else { return }
+        if event.success {
+            if event.status == request.expectedStatus {
+                if request.waitForUpload {
+                    request.stoppedEvent = event
+                    if request.uploadSucceeded {
+                        request.pending.resolve(event)
+                    }
+                } else {
+                    request.pending.resolve(event)
+                }
+            }
+        } else {
+            request.pending.reject(
+                BluetoothSdkError(
+                    code: event.status.isEmpty ? "video_recording_failed" : event.status,
+                    message: event.details ?? "Video recording command failed."
+                )
+            )
+        }
+    }
+
+    private func handleMediaUploadForRequests(_ event: MediaUploadEvent) {
+        guard event.isVideo, let request = pendingVideoRecordingRequests[event.requestId], request.waitForUpload else {
+            return
+        }
+        if event.isSuccess {
+            if let stoppedEvent = request.stoppedEvent {
+                request.pending.resolve(stoppedEvent)
+            } else {
+                request.uploadSucceeded = true
+            }
+        } else {
+            request.pending.reject(
+                BluetoothSdkError(
+                    code: "video_upload_failed",
+                    message: event.errorMessage ?? "Video upload failed."
+                )
+            )
+        }
+    }
+
+    private func handleRgbLedResponseForRequests(_ event: RgbLedControlResponseEvent) {
+        guard let pending = pendingRgbLedRequests[event.requestId] else { return }
+        if event.state == "success" {
+            pending.resolve(event)
+        } else {
+            pending.reject(
+                BluetoothSdkError(
+                    code: event.errorCode ?? "rgb_led_control_failed",
+                    message: event.errorCode ?? "RGB LED command failed."
+                )
+            )
+        }
+    }
+
+    private func handleSettingsAckForRequests(_ event: SettingsAckEvent) {
+        guard let pending = pendingSettingsRequests[event.requestId] else { return }
+        if isFailureStatus(event.status) {
+            let fallbackSetting = event.setting.isEmpty ? event.requestId : event.setting
+            pending.reject(
+                BluetoothSdkError(
+                    code: event.errorCode ?? "\(event.setting.isEmpty ? "settings" : event.setting)_failed",
+                    message: event.errorMessage ?? "Settings command \(fallbackSetting) failed."
+                )
+            )
+        } else {
+            pending.resolve(event)
+        }
+    }
+
+    private func isFailureStatus(_ status: String) -> Bool {
+        ["error", "failed", "failure", "rejected"].contains(status.lowercased())
+    }
+
+    private func handleWifiScanResultsForRequests(_ results: [WifiScanResult]) {
+        guard let request = pendingWifiScan else { return }
+        if pendingWifiScan === request {
+            pendingWifiScan = nil
+        }
+        request.pending.resolve(results)
+    }
+
+    /// scanId-echoing glasses: results for another scan are ignored instead of
+    /// resolving the pending request, and matching chunks accumulate until the
+    /// glasses flag the scan complete.
+    private func handleCorrelatedWifiScanChunk(
+        scanId: String,
+        results: [WifiScanResult],
+        scanComplete: Bool
+    ) {
+        guard let request = pendingWifiScan, request.scanId == scanId else { return }
+        for network in results where !request.accumulated.contains(where: { $0.ssid == network.ssid }) {
+            request.accumulated.append(network)
+        }
+        if !request.accumulated.isEmpty {
+            request.latestResults = request.accumulated
+        }
+        guard scanComplete else { return }
+        if pendingWifiScan === request {
+            pendingWifiScan = nil
+        }
+        request.pending.resolve(request.accumulated)
+    }
+
+    private func updateWifiScanLatestResults(_ results: [WifiScanResult]) {
+        guard !results.isEmpty else { return }
+        pendingWifiScan?.latestResults = results
+    }
+
+    private func handleWifiStatusForRequests(_ event: WifiStatusEvent) {
+        let connectRequest = pendingWifiStatus
+        // A wifi_status carrying the explicit error field is the glasses' failure
+        // verdict for the in-flight connect: reject now instead of running out the
+        // request timeout. Only the error field counts as failure — the glasses'
+        // connect sequence emits a debounced bare connected=false ~1-2s after
+        // credentials while association is still in progress, and rejecting on that
+        // would kill every connect attempt early.
+        if let connectRequest, let error = event.error {
+            if pendingWifiStatus === connectRequest {
+                pendingWifiStatus = nil
+            }
+            connectRequest.pending.reject(
+                BluetoothSdkError(
+                    code: error,
+                    message: "Glasses failed to join \"\(connectRequest.ssid)\": \(error)"
+                )
+            )
+            return
+        }
+        if let connectRequest, wifiStatusMatchesConnect(event.status, ssid: connectRequest.ssid) {
+            if pendingWifiStatus === connectRequest {
+                pendingWifiStatus = nil
+            }
+            connectRequest.pending.resolve(event)
+            return
+        }
+
+        // Forget never settles from link state: modern requests require a correlated result,
+        // while legacy requests resolve as unverified at accepted dispatch.
+    }
+
+    private func handleWifiForgetResultForRequests(_ data: [String: Any]) {
+        guard let request = pendingWifiForget,
+              request.mode == .modern,
+              request.epoch == wifiSessionCapabilities.epoch,
+              case let .supported(version) = wifiSessionCapabilities.forgetResult,
+              let result = parseWifiForgetResult(
+                  expectedRequestId: request.requestId,
+                  expectedSid: request.sid,
+                  expectedSsid: request.ssid,
+                  capabilityVersion: version,
+                  data: data
+              )
+        else { return }
+        if pendingWifiForget === request, request.epoch == wifiSessionCapabilities.epoch {
+            pendingWifiForget = nil
+        }
+        request.pending.resolve(result)
+    }
+
+    private func handleSavedWifiNetworksForRequests(_ data: [String: Any]) {
+        guard let request = pendingSavedWifiNetworks,
+              request.mode == .modern,
+              request.epoch == wifiSessionCapabilities.epoch,
+              case let .supported(version) = wifiSessionCapabilities.savedNetworks,
+              let result = parseSavedWifiNetworks(
+                  expectedRequestId: request.requestId,
+                  expectedSid: request.sid,
+                  capabilityVersion: version,
+                  data: data
+              )
+        else { return }
+        if pendingSavedWifiNetworks === request, request.epoch == wifiSessionCapabilities.epoch {
+            pendingSavedWifiNetworks = nil
+        }
+        request.pending.resolve(result)
+    }
+
+    private func wifiStatusMatchesConnect(_ status: WifiStatus, ssid: String) -> Bool {
+        if case let .connected(currentSsid, _) = status {
+            return currentSsid == ssid
+        }
+        return false
+    }
+
+    private func dispatchWifiForgetIfReady(_ request: PendingWifiForgetRequest) {
+        guard pendingWifiForget === request,
+              request.epoch == wifiSessionCapabilities.epoch,
+              request.mode != .discovering,
+              !request.commandSent
+        else { return }
+        if request.mode == .unsupported {
+            request.pending.reject(BluetoothSdkError(code: "wifi_protocol_unsupported", message: "Unsupported WiFi forget protocol version."))
+            return
+        }
+        request.sid = wifiSessionCapabilities.sessionId
+        request.commandSent = DeviceManager.shared.forgetWifiNetwork(
+            request.ssid,
+            requestId: request.mode == .modern ? request.requestId : nil,
+            sid: request.mode == .modern ? request.sid : nil
+        )
+        if !request.commandSent {
+            request.pending.reject(BluetoothSdkError(code: "dispatch_failed", message: "No active glasses transport accepted WiFi forget."))
+        } else if request.mode == .legacy {
+            pendingWifiForget = nil
+            request.pending.resolve(legacyWifiForgetResult(ssid: request.ssid))
+        }
+    }
+
+    private func dispatchSavedWifiNetworksIfReady(_ request: PendingSavedWifiNetworks) {
+        guard pendingSavedWifiNetworks === request,
+              request.epoch == wifiSessionCapabilities.epoch,
+              request.mode == .modern,
+              !request.commandSent
+        else { return }
+        request.sid = wifiSessionCapabilities.sessionId
+        request.commandSent = DeviceManager.shared.requestSavedWifiNetworks(requestId: request.requestId, sid: request.sid)
+        if !request.commandSent {
+            request.pending.reject(BluetoothSdkError(code: "dispatch_failed", message: "No active glasses transport accepted saved WiFi request."))
+        }
+    }
+
+    private func applyWifiProtocolCapabilities(_ data: [String: Any]) {
+        wifiSessionCapabilities.applyVersionInfo1(data)
+        if let request = pendingWifiForget,
+           request.epoch == wifiSessionCapabilities.epoch,
+           request.mode == .discovering
+        {
+            request.mode = wifiSessionCapabilities.forgetMode()
+            dispatchWifiForgetIfReady(request)
+        }
+        if let request = pendingSavedWifiNetworks,
+           request.epoch == wifiSessionCapabilities.epoch,
+           request.mode == .discovering
+        {
+            request.mode = wifiSessionCapabilities.savedNetworksMode()
+            if request.mode == .legacy || request.mode == .unsupported {
+                pendingSavedWifiNetworks = nil
+                request.pending.resolve(
+                    SavedWifiNetworksResult(
+                        outcome: .unsupported,
+                        networks: [],
+                        error: "saved_wifi_networks_unsupported"
+                    )
+                )
+            } else {
+                dispatchSavedWifiNetworksIfReady(request)
+            }
+        }
+    }
+
+    private func resetWifiProtocolSession(sessionId: String, code: String) {
+        let error = BluetoothSdkError(code: code, message: "The glasses WiFi protocol session changed.")
+        let wifiStatus = pendingWifiStatus?.pending
+        let wifiForget = pendingWifiForget?.pending
+        let savedNetworks = pendingSavedWifiNetworks?.pending
+        let wifiScan = pendingWifiScan?.pending
+        let hotspot = pendingHotspotStatus?.pending
+        wifiSessionCapabilities.reset(sessionId: sessionId)
+        pendingWifiStatus = nil
+        pendingWifiForget = nil
+        pendingSavedWifiNetworks = nil
+        pendingWifiScan = nil
+        pendingHotspotStatus = nil
+        wifiStatus?.reject(error)
+        wifiForget?.reject(error)
+        savedNetworks?.reject(error)
+        wifiScan?.reject(error)
+        hotspot?.reject(error)
+    }
+
+    private func handleHotspotStatusForRequests(_ event: HotspotStatusEvent) {
+        guard let request = pendingHotspotStatus else { return }
+        guard hotspotStatusMatches(event.status, enabled: request.enabled) else { return }
+        if pendingHotspotStatus === request {
+            pendingHotspotStatus = nil
+        }
+        request.pending.resolve(event)
+    }
+
+    private func hotspotStatusMatches(_ status: HotspotStatus, enabled: Bool) -> Bool {
+        if enabled {
+            return status.isEnabled
+        }
+        return status == .disabled
+    }
+
+    private func handleHotspotErrorForRequests(_ event: HotspotErrorEvent) {
+        guard let request = pendingHotspotStatus else { return }
+        if pendingHotspotStatus === request {
+            pendingHotspotStatus = nil
+        }
+        request.pending.reject(
+            BluetoothSdkError(
+                code: "hotspot_command_failed",
+                message: event.message ?? "Hotspot command failed."
+            )
+        )
+    }
+
+    private func recordStreamStatus(_ event: StreamStatusEvent) {
+        guard analytics.isEnabled else { return }
+        let attempt: Int?
+        var statusErrorDetails: String?
+        switch event.status {
+        case let .reconnecting(_, reconnectAttempt, _, _, _, _), let .reconnected(_, reconnectAttempt, _, _):
+            attempt = reconnectAttempt
+        case let .error(_, errorDetails, _, _):
+            attempt = nil
+            statusErrorDetails = errorDetails
+        default:
+            attempt = nil
+        }
+        let errorDetails = event.errorDetails ?? statusErrorDetails
+        let stats = event.stats
+        let now = BluetoothSdkAnalytics.epochMillis()
+        analytics.recordUsage {
+            $0.streamStatus(
+                streamId: event.streamId,
+                state: event.state.rawValue,
+                terminal: event.terminal,
+                reconnectAttempt: attempt,
+                bitrate: stats?.bitrate,
+                fps: stats?.fps,
+                droppedFrames: stats?.droppedFrames,
+                temperatureC: stats?.temperatureC,
+                errorDetails: errorDetails,
+                nowMs: now
+            )
+        }
+    }
+
+    private func glassesNetwork() -> String {
+        let glasses = glassesStatus
+        if case .enabled = glasses.hotspot { return "hotspot" }
+        if case .connected = glasses.wifi { return "wifi" }
+        return "none"
+    }
+
+    /// Runs a glasses command and reports its latency and outcome to usage
+    /// analytics. Cancellation is the caller giving up, not a command outcome, so
+    /// it is not reported.
+    private func withUsageOutcome<T>(
+        record: (_ latencyMs: Int64, _ errorCode: String?, _ result: T?) -> Void,
+        _ block: () async throws -> T
+    ) async throws -> T {
+        let startedAt = ProcessInfo.processInfo.systemUptime
+        func elapsedMs() -> Int64 {
+            Int64(((ProcessInfo.processInfo.systemUptime - startedAt) * 1000).rounded(.down))
+        }
+        let result: T
+        do {
+            result = try await block()
+        } catch {
+            let sdkError = error as? BluetoothSdkError
+            let cancelled = error is CancellationError || sdkError?.code == "request_cancelled"
+            if analytics.isEnabled, !cancelled {
+                record(elapsedMs(), sdkError?.code ?? String(describing: type(of: error)), nil)
+            }
+            throw error
+        }
+        if analytics.isEnabled { record(elapsedMs(), nil, result) }
+        return result
+    }
+
+    private func dispatchStoreUpdate(_ category: String, _ changes: [String: Any]) {
+        switch ObservableStore.normalizeCategory(category) {
+        case "glasses":
+            if changes["connected"] as? Bool == false {
+                resetWifiProtocolSession(sessionId: "", code: "wifi_session_disconnected")
+                besCrashReports.rejectAll(BluetoothSdkError(
+                    code: "glasses_not_connected",
+                    message: "Glasses disconnected before acknowledging bes_crash_reported."
+                ))
+            }
+            // CBCentralManager state is read here on the main actor, not on the analytics queue.
+            let phoneBluetoothOff = BluetoothAvailability.shared.isPoweredOff
+            analytics.observeGlassesStatus(glassesStatus) { phoneBluetoothOff }
+            let nextState = state
+            delegate?.mentraBluetoothSDK(self, didUpdate: nextState)
+            delegate?.mentraBluetoothSDK(self, didUpdateGlasses: nextState.glasses)
+        case ObservableStore.bluetoothCategory:
+            if analytics.isEnabled, changes.keys.contains(where: { Self.micStateKeys.contains($0) }) {
+                let bluetooth = bluetoothStatus
+                let transcribing = bluetooth.shouldSendTranscript || bluetooth.localSttFallbackActive
+                let now = BluetoothSdkAnalytics.epochMillis()
+                analytics.recordUsage { $0.observeMic(currentMic: bluetooth.currentMic, transcribing: transcribing, nowMs: now) }
+            }
+            let nextState = state
+            delegate?.mentraBluetoothSDK(self, didUpdate: nextState)
+            delegate?.mentraBluetoothSDK(self, didUpdateSdkState: nextState.sdk)
+            delegate?.mentraBluetoothSDK(self, didUpdateScan: nextState.scan)
+            if !suppressDefaultDeviceEvents && changes.keys.contains(where: { defaultDeviceKeys.contains($0) }) {
+                dispatchDefaultDeviceChanged()
+            }
+            dispatchDiscoveredDevices(changes["searchResults"])
+            dispatchScanResults(changes["searchResults"])
+        default:
+            break
+        }
+    }
+
+    private func dispatchDefaultDeviceChanged() {
+        delegate?.mentraBluetoothSDK(self, didChangeDefaultDevice: currentDefaultDevice())
+    }
+
+    private func finishDefaultDeviceApply(generation: Int) {
+        Task { @MainActor [weak self] in
+            guard let self, generation == self.defaultDeviceApplyGeneration else { return }
+            self.suppressDefaultDeviceEvents = false
+            self.dispatchDefaultDeviceChanged()
+        }
+    }
+
+    private func currentDefaultDevice() -> Device? {
+        let core = DeviceStore.shared.store.getCategory(ObservableStore.bluetoothCategory)
+        guard let model = core["default_wearable"] as? String, !model.isEmpty else { return nil }
+        guard let name = core["device_name"] as? String, !name.isEmpty else { return nil }
+        let identifier = (core["device_address"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        let projectName = (core["project_name"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        return Device(
+            model: DeviceModel.fromDeviceType(model),
+            name: name,
+            identifier: identifier,
+            projectName: projectName
+        )
+    }
+
+    private func dispatchDiscoveredDevices(_ rawSearchResults: Any?) {
+        guard let results = rawSearchResults as? [[String: Any]] else { return }
+        for result in results {
+            guard let name = result["name"] as? String else { continue }
+            guard discoveredDeviceNames.insert(name).inserted else { continue }
+            guard let device = Device(values: result) else { continue }
+            delegate?.mentraBluetoothSDK(self, didDiscover: device)
+        }
+    }
+
+    private func dispatchScanResults(_ rawSearchResults: Any?) {
+        guard let results = rawSearchResults as? [[String: Any]] else { return }
+        let devices = results.compactMap(Device.init(values:))
+        for id in Array(activeScanSessions.keys) {
+            guard let activeSession = activeScanSessions[id] else { continue }
+            emitScanResults(devices.filter { $0.model == activeSession.model }, forSession: id)
+        }
+    }
+
+    private func emitScanResults(_ devices: [Device], forSession id: UUID) {
+        guard let activeSession = activeScanSessions[id] else { return }
+        activeSession.latestResults = devices
+        activeSession.onResults(devices)
+    }
+
+    /// Used by both the native scan callback and the React Native scan wrapper.
+    func scanDiagnostic(for model: DeviceModel) -> ScanDiagnostic? {
+        let status = glassesStatus
+        guard model != .simulated, !status.connected,
+              status.connectionState != .connected, status.connectionState != .connecting,
+              status.connectionState != .bonding else { return nil }
+        let services = ConnectedDeviceMatcher.serviceUUIDs(for: model).map { CBUUID(string: $0) }
+        let saved = currentDefaultDevice()
+        guard let device = BluetoothAvailability.shared.connectedPeripherals(withServices: services).first(where: {
+            ConnectedDeviceMatcher.matches(model: model, defaultDevice: saved, name: $0.name, identifier: $0.identifier.uuidString)
+        }) else { return nil }
+        let name = device.name.flatMap { $0.isEmpty ? nil : $0 } ?? device.identifier.uuidString
+        return ScanDiagnostic(
+            code: "device_connected_on_phone",
+            message: "Scan found no glasses, but a matching device \"\(name)\" is already connected to this phone. " +
+                "If another app is using it, disconnect it there and scan again."
+        )
+    }
+
+    private func finishScanSession(_ id: UUID, reason: ScanStopReason, shouldStopScan: Bool) {
+        guard let activeSession = activeScanSessions.removeValue(forKey: id) else { return }
+        activeSession.timeoutTask?.cancel()
+        activeSession.publicSession?.markStopped()
+        if shouldStopScan {
+            stopScan(reason: reason)
+        }
+        if reason == .completed, activeSession.latestResults.isEmpty,
+           let onDiagnostic = activeSession.onDiagnostic, let diagnostic = scanDiagnostic(for: activeSession.model)
+        {
+            onDiagnostic(diagnostic)
+        }
+        activeSession.onComplete(activeSession.latestResults)
+    }
+
+    private func handleVersionInfoForRequest(_ data: [String: Any]) {
+        guard let request = pendingVersionInfo else { return }
+        let outcome = request.accumulator.accept(data)
+        var response: [String: Any] = [
+            "responseRequestId": String((data[VersionInfoResponseAccumulator.responseRequestIdKey] as? String ?? "").prefix(128)),
+            "responseChunk": String((data[VersionInfoResponseAccumulator.responseChunkKey] as? String ?? "").prefix(64)),
+        ]
+        for key in [VersionInfoResponseAccumulator.responseIndexKey,
+                    VersionInfoResponseAccumulator.responseCountKey,
+                    VersionInfoResponseAccumulator.responseFinalKey]
+        {
+            // Typed strings survive the logger's Bool/NSNumber sanitization and
+            // preserve malformed metadata rather than making it look valid.
+            if let value = data[key] as? NSNumber {
+                response[key] = CFGetTypeID(value) == CFBooleanGetTypeID()
+                    ? "boolean:\(value.boolValue)" : "number:\(value.stringValue)"
+            } else if let value = data[key] as? String {
+                response[key] = "string:\(value.prefix(64))"
+            } else if let value = data[key] {
+                response[key] = "unsupported:\(type(of: value))"
+            }
+        }
+        switch outcome {
+        case .ignored:
+            logVersionInfoRequest(request, stage: "response-ignored", extra: response)
+        case .waiting:
+            logVersionInfoRequest(request, stage: "response-waiting", extra: response)
+        case let .complete(result):
+            logVersionInfoRequest(request, stage: "response-complete", extra: response)
+            pendingVersionInfo = nil
+            request.pending.resolve(result)
+        }
+    }
+
+    private func logVersionInfoRequest(_ request: PendingVersionInfoRequest, stage: String, extra: [String: Any] = [:]) {
+        var payload: [String: Any] = [
+            "requestId": request.requestId,
+            "stage": stage,
+            "elapsedMs": Int((ProcessInfo.processInfo.systemUptime - request.startedAt) * 1000),
+        ]
+        payload.merge(extra) { _, value in value }
+        BleTraceLogger.logMap(direction: "phone_app", layer: "sdk_version_request", type: "version_info", payload: payload)
+    }
+
+    private func dispatchBridgeEvent(_ eventName: String, _ data: [String: Any]) {
+        switch eventName {
+        case "log":
+            delegate?.mentraBluetoothSDK(self, didLog: data["message"] as? String ?? data.description)
+        case "button_press":
+            let event = ButtonPressEvent(
+                buttonId: data["buttonId"] as? String ?? "",
+                pressType: data["pressType"] as? String ?? "",
+                timestamp: intValue(data["timestamp"])
+            )
+            delegate?.mentraBluetoothSDK(self, didReceive: .buttonPress(event))
+        case "touch_event":
+            delegate?.mentraBluetoothSDK(self, didReceive: .touch(TouchEvent(values: data)))
+        case "mic_pcm":
+            let event = MicPcmEvent(values: data)
+            if !event.pcm.isEmpty {
+                delegate?.mentraBluetoothSDK(self, didReceiveMicPcm: event)
+            }
+        case "mic_lc3":
+            let event = MicLc3Event(values: data)
+            if !event.lc3.isEmpty {
+                delegate?.mentraBluetoothSDK(self, didReceiveMicLc3: event)
+            }
+        case "mic_health":
+            delegate?.mentraBluetoothSDK(self, didReceive: .micHealth(MicHealthEvent(values: data)))
+        case "local_transcription":
+            let event = LocalTranscriptionEvent(
+                text: data["text"] as? String ?? "",
+                isFinal: data["isFinal"] as? Bool ?? false,
+                values: data
+            )
+            delegate?.mentraBluetoothSDK(self, didReceive: .localTranscription(event))
+        case "voice_activity_detection_status":
+            delegate?.mentraBluetoothSDK(
+                self,
+                didReceive: .voiceActivityDetectionStatus(VoiceActivityDetectionStatusEvent(values: data))
+            )
+        case "speaking_status":
+            delegate?.mentraBluetoothSDK(
+                self,
+                didReceive: .speakingStatus(SpeakingStatusEvent(values: data))
+            )
+        case "hotspot_status_change":
+            let event = HotspotStatusEvent(values: data)
+            handleHotspotStatusForRequests(event)
+            delegate?.mentraBluetoothSDK(self, didReceive: .hotspotStatus(event))
+        case "wifi_status_change":
+            let event = WifiStatusEvent(values: data)
+            handleWifiStatusForRequests(event)
+            delegate?.mentraBluetoothSDK(self, didReceive: .wifiStatus(event))
+        case "wifi_forget_result":
+            handleWifiForgetResultForRequests(data)
+            delegate?.mentraBluetoothSDK(self, didReceive: .raw(name: eventName, values: data))
+        case "saved_wifi_networks":
+            handleSavedWifiNetworksForRequests(data)
+            delegate?.mentraBluetoothSDK(self, didReceive: .raw(name: eventName, values: data))
+        case "wifi_protocol_session_ready":
+            resetWifiProtocolSession(
+                sessionId: data["sid"] as? String ?? "",
+                code: "wifi_session_restarted"
+            )
+        case "glasses_session_changed":
+            resetWifiProtocolSession(
+                sessionId: data["sid"] as? String ?? "",
+                code: "wifi_session_changed"
+            )
+            delegate?.mentraBluetoothSDK(self, didReceive: .raw(name: eventName, values: data))
+        case "wifi_scan_result":
+            let networks = (data["networks"] as? [[String: Any]])?.map(WifiScanResult.init(values:)) ?? []
+            let hasCompletionFlag = data.keys.contains("scanComplete") || data.keys.contains("scan_complete")
+            let scanComplete = data["scanComplete"] as? Bool ?? data["scan_complete"] as? Bool ?? false
+            let scanId = (data["scanId"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            if let scanId {
+                handleCorrelatedWifiScanChunk(scanId: scanId, results: networks, scanComplete: scanComplete)
+            } else {
+                // Old firmware: no correlation id, keep the pre-scanId heuristics.
+                updateWifiScanLatestResults(networks)
+                if scanComplete || !hasCompletionFlag {
+                    handleWifiScanResultsForRequests(networks)
+                }
+            }
+            delegate?.mentraBluetoothSDK(self, didReceive: .raw(name: "wifi_scan_result", values: data))
+        case "hotspot_error":
+            let event = HotspotErrorEvent(values: data)
+            handleHotspotErrorForRequests(event)
+            delegate?.mentraBluetoothSDK(self, didReceive: .hotspotError(event))
+        case "gallery_status":
+            let event = GalleryStatusEvent(values: data)
+            pendingGalleryStatus?.resolve(event)
+            delegate?.mentraBluetoothSDK(self, didReceive: .raw(name: "gallery_status", values: event.values))
+        case "pairing_info", "pairing_state_changed", "audio_setup_changed":
+            delegate?.mentraBluetoothSDK(self, didReceive: .raw(name: eventName, values: data))
+        case "entering_pairing_mode", "pairing_mode_ended", "owner_replaced":
+            delegate?.mentraBluetoothSDK(self, didReceive: .raw(name: eventName, values: data))
+        case "photo_response":
+            let event = PhotoResponseEvent(values: data)
+            handlePhotoResponseForRequests(event)
+            if case let .error(requestId, errorCode, _, _) = event.response,
+               requestId == BluetoothSdkUsageTracker.localPhotoRequestId
+            {
+                analytics.recordUsage { $0.buttonPhotoFailed(errorCode: errorCode) }
+            }
+            delegate?.mentraBluetoothSDK(self, didReceive: .photoResponse(event))
+        case "photo_status":
+            delegate?.mentraBluetoothSDK(self, didReceive: .photoStatus(PhotoStatusEvent(values: data)))
+        case "camera_status":
+            let event = CameraStatusEvent(values: data)
+            handleCameraStatusForRequests(event)
+            delegate?.mentraBluetoothSDK(self, didReceive: .cameraStatus(event))
+        case "video_recording_status":
+            let event = VideoRecordingStatusEvent(values: data)
+            handleVideoRecordingStatusForRequests(event)
+            let now = BluetoothSdkAnalytics.epochMillis()
+            analytics.recordUsage {
+                $0.videoStatus(requestId: event.requestId, status: event.status, success: event.success, nowMs: now)
+            }
+            delegate?.mentraBluetoothSDK(self, didReceive: .videoRecordingStatus(event))
+        case "media_success", "media_error":
+            let event = MediaUploadEvent(values: data)
+            handleMediaUploadForRequests(event)
+            delegate?.mentraBluetoothSDK(self, didReceive: .mediaUpload(event))
+        case "rgb_led_control_response":
+            let event = RgbLedControlResponseEvent(values: data)
+            handleRgbLedResponseForRequests(event)
+            delegate?.mentraBluetoothSDK(self, didReceive: .rgbLedControlResponse(event))
+        case "stream_control_ready":
+            streamSession.ready(sessionId: data["sid"] as? String, controlVersion: data["streamControlVersion"] as? Int)
+        case "stream_status":
+            if data["revision"] != nil && !streamSession.accept(data) { return }
+            let event = StreamStatusEvent(values: data)
+            handleStreamStatusForRequests(event)
+            recordStreamStatus(event)
+            delegate?.mentraBluetoothSDK(self, didReceive: .streamStatus(event))
+        case "keep_alive_ack":
+            let event = KeepAliveAckEvent(values: data)
+            delegate?.mentraBluetoothSDK(self, didReceive: .keepAliveAck(event))
+        case "ota_start_ack":
+            var values = data
+            values["type"] = "ota_start_ack"
+            let event = OtaStartAckEvent(values: values)
+            pendingOtaStart?.resolve(event)
+            delegate?.mentraBluetoothSDK(self, didReceive: .otaStartAck(event))
+        case "ota_status":
+            var resultValues = data
+            resultValues["type"] = "ota_status"
+            pendingOtaQuery?.resolve(OtaQueryResult(values: resultValues))
+            let event = OtaStatusEvent(values: resultValues)
+            if let errorCode = otaStartRejectionErrorCode(event) {
+                pendingOtaStart?.reject(
+                    BluetoothSdkError(code: errorCode, message: "Glasses rejected OTA start: \(errorCode)")
+                )
+            }
+            if analytics.isEnabled {
+                let glasses = glassesStatus
+                let now = BluetoothSdkAnalytics.epochMillis()
+                analytics.recordUsage {
+                    $0.otaStatus(
+                        sessionId: event.sessionId,
+                        status: event.status,
+                        stepType: event.stepType,
+                        totalSteps: event.totalSteps,
+                        errorMessage: event.errorMessage,
+                        fromBuildNumber: glasses.buildNumber,
+                        fromBesFirmwareVersion: glasses.besFirmwareVersion,
+                        fromMtkFirmwareVersion: glasses.mtkFirmwareVersion,
+                        nowMs: now
+                    )
+                }
+            }
+            delegate?.mentraBluetoothSDK(self, didReceive: .otaStatus(event))
+        case "bes_crash_detected":
+            var values = data
+            values["type"] = "bes_crash_detected"
+            delegate?.mentraBluetoothSDK(self, didReceive: .besCrashDetected(BesCrashDetectedEvent(values: values)))
+        case "bes_crash_reported_ack":
+            // Request-scoped: consumed by the waiting sendBesCrashReported call, never a delegate event.
+            besCrashReports.onAck(data)
+        case "settings_ack":
+            let event = SettingsAckEvent(values: data)
+            handleSettingsAckForRequests(event)
+            delegate?.mentraBluetoothSDK(self, didReceive: .settingsAck(event))
+        case "version_info":
+            if let infoType = data["versionInfoType"] as? String, ["version_info_1", "version_info"].contains(infoType) {
+                applyWifiProtocolCapabilities(data)
+            }
+            let event = VersionInfoResult(values: data)
+            handleVersionInfoForRequest(data)
+            delegate?.mentraBluetoothSDK(self, didReceive: .versionInfo(event))
+        case "compatible_glasses_search_stop":
+            delegate?.mentraBluetoothSDK(self, didStopScan: .completed)
+        case "pair_failure":
+            delegate?.mentraBluetoothSDK(
+                self,
+                didFail: BluetoothSdkError(
+                    code: "pair_failure",
+                    message: data["error"] as? String ?? data.description,
+                    failureCode: data["code"] as? String
+                )
+            )
+        default:
+            delegate?.mentraBluetoothSDK(self, didReceive: .raw(name: eventName, values: data))
+        }
+    }
+}
+
+/// OTA status messages are not request-correlated, so only known pre-ack failures settle a start.
+private func otaStartRejectionErrorCode(_ event: OtaStatusEvent) -> String? {
+    guard event.status.lowercased() == "failed",
+          event.errorMessage?.lowercased() == "battery_low"
+    else {
+        return nil
+    }
+    return "battery_low"
+}

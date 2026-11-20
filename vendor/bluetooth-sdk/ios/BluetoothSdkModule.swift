@@ -1,0 +1,1144 @@
+import CryptoKit
+import ExpoModulesCore
+import Foundation
+
+/// Carry the SDK's own error code across the Expo bridge.
+///
+/// `BluetoothSdkError` is a plain `Error`, not an Expo `Exception`, so `Promise.reject`
+/// wraps it in `UnexpectedException` and every code JS branches on arrives as
+/// `ERR_UNEXPECTED`. Android keeps the code because `DecoratedException` forwards
+/// `cause.code`; this is the iOS half of that guarantee.
+private func codedBridgeError(_ error: BluetoothSdkError) -> Exception {
+    Exception(name: error.code, description: error.message, code: error.code)
+}
+
+/// Offline model archives take tens of seconds to extract. Android runs this on Dispatchers.IO;
+/// on Expo's shared default queue it would hold every other module's AsyncFunction behind it.
+private let modelExtractionQueue = DispatchQueue(label: "com.mentra.model-extraction", qos: .utility)
+
+public class BluetoothSdkModule: Module, MentraBluetoothSDKDelegate {
+    private var sdk: MentraBluetoothSDK?
+
+    public func definition() -> ModuleDefinition {
+        Name("BluetoothSdk")
+
+        // Define events that can be sent to JavaScript
+        Events(
+            "glasses_status",
+            "bluetooth_status",
+            "log",
+            "sdk_update_notice",
+            "device_discovered",
+            "default_device_changed",
+            // Individual event handlers
+            "glasses_not_ready",
+            "button_press",
+            "touch_event",
+            "accel_event",
+            "CompassHeadingEvent",
+            "CompassCalibrationEvent",
+            "head_up",
+            "voice_activity_detection_status",
+            "speaking_status",
+            "battery_status",
+            "wifi_status_change",
+            "wifi_scan_result",
+            "wifi_forget_result",
+            "saved_wifi_networks",
+            "hotspot_status_change",
+            "hotspot_error",
+            "photo_response",
+            "photo_status",
+            "camera_status",
+            "video_recording_status",
+            "media_success",
+            "media_error",
+            "gallery_status",
+            "compatible_glasses_search_stop",
+            "heartbeat_sent",
+            "heartbeat_received",
+            "swipe_volume_status",
+            "switch_status",
+            "mic_tuning_state",
+            "mic_rms",
+            "wear_state",
+            "wear_tuning",
+            "rgb_led_control_response",
+            "settings_ack",
+            "version_info",
+            "pair_failure",
+            "pairing_info",
+            "entering_pairing_mode",
+            "pairing_mode_ended",
+            "pairing_state_changed",
+            "audio_setup_changed",
+            "owner_replaced",
+            "audio_pairing_needed",
+            "audio_connected",
+            "audio_disconnected",
+            "save_setting",
+            "local_transcription",
+            "wake_word",
+            "speech_activity",
+            "phone_notification",
+            "native_notification_status",
+            "native_notification_delivery",
+            "phone_notification_dismissed",
+            "ws_text",
+            "ws_bin",
+            "mic_pcm",
+            "mic_lc3",
+            "mic_health",
+            "stream_status",
+            "keep_alive_ack",
+            "mtk_update_complete",
+            "glasses_session_changed",
+            "ota_progress",
+            "ota_start_ack",
+            "ota_status",
+            "ar99_ota_status",
+            "bes_crash_detected",
+            "send_command_to_ble",
+            "receive_command_from_ble",
+            "miniapp_selected",
+            "extraction_progress"
+        )
+
+        OnCreate {
+            JSCExperiment.maybeAutoBenchmark()
+            Task { @MainActor [weak self] in
+                _ = self?.bluetoothSdk()
+            }
+        }
+
+        OnDestroy {
+            Task {
+                await PcmStreamManager.abortAll()
+            }
+            Task { @MainActor [weak self] in
+                self?.sdk?.invalidate()
+                self?.sdk = nil
+            }
+        }
+
+        // MARK: - Observable Store Functions
+
+        Function("getGlassesStatus") { () -> [String: Any] in
+            self.readOnMainActor {
+                self.bluetoothSdk().glassesStatus.dictionary
+            }
+        }
+
+        Function("getBluetoothStatus") { () -> [String: Any] in
+            self.readOnMainActor {
+                self.bluetoothSdk().bluetoothStatus.values
+            }
+        }
+
+        Function("getDefaultDevice") { () -> [String: Any]? in
+            self.readOnMainActor {
+                self.bluetoothSdk().getDefaultDevice()?.dictionary
+            }
+        }
+
+        AsyncFunction("update") { (category: String, values: [String: Any]) in
+            await MainActor.run {
+                let normalizedCategory = ObservableStore.normalizeCategory(category)
+                for (key, value) in values {
+                    if value is NSNull { continue }
+                    DeviceStore.shared.apply(normalizedCategory, key, value)
+                }
+            }
+        }
+
+        // MARK: - Display Commands
+
+        AsyncFunction("displayEvent") { (params: [String: Any]) in
+            let sdk = await MainActor.run { self.bluetoothSdk() }
+            try? await sdk.displayEvent(DisplayEventRequest(values: params))
+        }
+
+        AsyncFunction("displayText") { (text: String, x: Int?, y: Int?, size: Int?) in
+            let sdk = await MainActor.run { self.bluetoothSdk() }
+            try? await sdk.displayText(text, x: x ?? 0, y: y ?? 0, size: size ?? 24)
+        }
+
+        AsyncFunction("setDashboardContent") { (content: String) in
+            let sdk = await MainActor.run { self.bluetoothSdk() }
+            await sdk.setDashboardContent(content)
+        }
+
+        // MARK: - Connection Commands
+
+        AsyncFunction("connectDefault") {
+            try await MainActor.run {
+                try self.bluetoothSdk().connectDefault()
+            }
+        }
+
+        AsyncFunction("connectDefaultWithOptions") { (options: [String: Any]) in
+            try await MainActor.run {
+                try self.bluetoothSdk().connectDefault(options: ConnectOptions(dictionary: options))
+            }
+        }
+
+        AsyncFunction("setDefaultDevice") { (device: [String: Any]?) in
+            await MainActor.run {
+                self.bluetoothSdk().setDefaultDevice(Device(dictionary: device))
+            }
+        }
+
+        AsyncFunction("connectWithOptions") { (device: [String: Any], options: [String: Any]) in
+            try await MainActor.run {
+                guard let target = Device(dictionary: device) else {
+                    throw BluetoothSdkError(
+                        code: "invalid_device",
+                        message: "connect requires a Device with model and name."
+                    )
+                }
+                try self.bluetoothSdk().connect(to: target, options: ConnectOptions(dictionary: options))
+            }
+        }
+
+        AsyncFunction("connectDefaultController") {
+            await MainActor.run {
+                DeviceManager.shared.connectDefaultController()
+            }
+        }
+
+        AsyncFunction("connectSimulated") {
+            await MainActor.run {
+                self.bluetoothSdk().connectSimulated()
+            }
+        }
+
+        AsyncFunction("disconnect") {
+            await MainActor.run {
+                self.bluetoothSdk().disconnect()
+            }
+        }
+
+        AsyncFunction("disconnectController") {
+            await MainActor.run {
+                DeviceManager.shared.disconnectController()
+            }
+        }
+
+        AsyncFunction("forget") {
+            await MainActor.run {
+                self.bluetoothSdk().forget()
+            }
+        }
+
+        AsyncFunction("unpair") {
+            try await self.bluetoothSdk().unpair()
+        }
+
+        AsyncFunction("forgetController") {
+            await MainActor.run {
+                DeviceManager.shared.forgetController()
+            }
+        }
+
+        AsyncFunction("startScan") { (model: String) in
+            try await MainActor.run {
+                try self.bluetoothSdk().startScan(model: DeviceModel.fromDeviceType(model))
+            }
+        }
+
+        AsyncFunction("getScanDiagnostic") { (model: String) -> [String: String]? in
+            await MainActor.run {
+                guard let diagnostic = self.bluetoothSdk().scanDiagnostic(for: DeviceModel.fromDeviceType(model)) else { return nil }
+                return ["code": diagnostic.code, "message": diagnostic.message]
+            }
+        }
+
+        AsyncFunction("stopScan") {
+            await MainActor.run {
+                self.bluetoothSdk().stopScan()
+            }
+        }
+
+        AsyncFunction("cancelConnectionAttempt") {
+            await MainActor.run {
+                self.bluetoothSdk().cancelConnectionAttempt()
+            }
+        }
+
+        AsyncFunction("showDashboard") {
+            await MainActor.run {
+                self.bluetoothSdk().showDashboard()
+            }
+        }
+
+        AsyncFunction("ping") {
+            await MainActor.run {
+                DeviceManager.shared.ping()
+            }
+        }
+
+        AsyncFunction("dbg1") {
+            await MainActor.run {
+                DeviceManager.shared.dbg1()
+                DeviceManager.shared.sgc?.dbg1()
+            }
+        }
+
+        AsyncFunction("dbg2") {
+            await MainActor.run {
+                DeviceManager.shared.dbg2()
+                DeviceManager.shared.sgc?.dbg2()
+            }
+        }
+
+        Function("getMemoryMB") { () -> Double in
+            MemoryMonitor.currentMemoryMB()
+        }
+
+        // MARK: - Mic tuning (internal SDK surface only)
+
+        AsyncFunction("setMicRmsTelemetry") { (enabled: Bool) in
+            await MainActor.run {
+                DeviceManager.shared.sgc?.setMicRmsTelemetry(enabled)
+            }
+        }
+
+        // Fire-and-forget: the answer arrives as a mic_tuning_state event, which
+        // the screen is subscribed to anyway.
+        AsyncFunction("requestMicTuningState") {
+            await MainActor.run {
+                DeviceManager.shared.sgc?.requestMicTuningState()
+            }
+        }
+
+        // MARK: - Wear detection (internal SDK surface only)
+
+        // All fire-and-forget; answers arrive as wear_state / wear_tuning events.
+        // Call through DeviceManager so the SGCManager-typed reference hits the
+        // protocol requirement (extension-only methods would silently no-op).
+        AsyncFunction("queryWearState") {
+            await MainActor.run {
+                DeviceManager.shared.queryWearState()
+            }
+        }
+
+        AsyncFunction("setWearReporting") { (enabled: Bool) in
+            await MainActor.run {
+                DeviceManager.shared.setWearReporting(enabled)
+            }
+        }
+
+        AsyncFunction("setWearTuning") { (intervalMs: Int, count: Int, majority: Int) in
+            await MainActor.run {
+                DeviceManager.shared.setWearTuning(intervalMs: intervalMs, count: count, majority: majority)
+            }
+        }
+
+        AsyncFunction("requestWearTuning") {
+            await MainActor.run {
+                DeviceManager.shared.requestWearTuning()
+            }
+        }
+
+        AsyncFunction("resetWearTuning") {
+            await MainActor.run {
+                DeviceManager.shared.resetWearTuning()
+            }
+        }
+
+        Function("jscSpawn") { (count: Int) -> Int in
+            JSCExperiment.spawn(count: count)
+        }
+
+        Function("jscKillAll") { () in
+            JSCExperiment.killAll()
+        }
+
+        Function("jscAliveCount") { () -> Int in
+            JSCExperiment.aliveCount()
+        }
+
+        Function("jscSpawnAndMeasure") { (count: Int, baselineMB: Double) -> [String: Any] in
+            JSCExperiment.spawnAndMeasure(count: count, baselineMB: baselineMB)
+        }
+
+        Function("jscRunBenchmark") { () in
+            JSCExperiment.runBenchmark()
+        }
+
+        // MARK: - Incident Reporting
+
+        AsyncFunction("sendIncidentId") { (incidentId: String, apiBaseUrl: String?) in
+            try await MainActor.run {
+                try self.bluetoothSdk().sendIncidentId(incidentId, apiBaseUrl: apiBaseUrl)
+            }
+        }
+
+        AsyncFunction("sendBesCrashReported") { (incidentKey: String, reportId: String) in
+            let sdk = await MainActor.run { self.bluetoothSdk() }
+            try await sdk.sendBesCrashReported(incidentKey: incidentKey, reportId: reportId)
+        }
+
+        AsyncFunction("configureNativeNotifications") { (values: [String: Any]) in
+            try await MainActor.run {
+                try self.bluetoothSdk().configureNativeNotifications(NativeNotificationConfig(
+                    enabled: values["enabled"] as? Bool ?? false,
+                    autoDisplay: values["autoDisplay"] as? Bool ?? true,
+                    durationSeconds: (values["durationSeconds"] as? NSNumber)?.intValue ?? 5,
+                    doNotDisturb: values["doNotDisturb"] as? Bool ?? false,
+                    blockedApps: values["blockedApps"] as? [String] ?? []
+                ))
+            }
+        }
+        AsyncFunction("getNativeNotificationStatus") {
+            await MainActor.run { self.bluetoothSdk().getNativeNotificationStatus().dictionary }
+        }
+
+        // MARK: - Native Notification Centre
+
+        AsyncFunction("sendPhoneNotification") { (_: [String: Any]) in
+            throw NativeNotificationError.unsupported
+        }
+
+        // MARK: - WiFi Commands
+
+        AsyncFunction("requestWifiScan") {
+            let sdk = await MainActor.run { self.bluetoothSdk() }
+            return try await sdk.requestWifiScan().map(\.dictionary)
+        }
+
+        AsyncFunction("getSavedWifiNetworks") {
+            let sdk = await MainActor.run { self.bluetoothSdk() }
+            return try await sdk.getSavedWifiNetworks().values
+        }
+
+        AsyncFunction("sendWifiCredentials") { (ssid: String, password: String) in
+            let sdk = await MainActor.run { self.bluetoothSdk() }
+            return try await sdk.sendWifiCredentials(ssid: ssid, password: password).values
+        }
+
+        AsyncFunction("forgetWifiNetwork") { (ssid: String) in
+            let sdk = await MainActor.run { self.bluetoothSdk() }
+            return try await sdk.forgetWifiNetwork(ssid: ssid).values
+        }
+
+        // The host retries a hotspot command that a Wi-Fi protocol session refresh
+        // cancelled, and branches on the code to tell that apart from a real failure,
+        // so this one has to reach JS with its code intact.
+        AsyncFunction("setHotspotState") { (enabled: Bool) in
+            let sdk = await MainActor.run { self.bluetoothSdk() }
+            do {
+                return try await sdk.setHotspotState(enabled: enabled).values
+            } catch let error as BluetoothSdkError {
+                throw codedBridgeError(error)
+            }
+        }
+
+        AsyncFunction("setWifiAdbState") { (enabled: Bool, expectedBluetoothMac: String?) in
+            let sdk = await MainActor.run { self.bluetoothSdk() }
+            try await sdk.setWifiAdbState(enabled: enabled, expectedBluetoothMac: expectedBluetoothMac)
+        }
+
+        AsyncFunction("setSystemTime") { (timestampMs: Double) in
+            let maxTimestamp = Double(Int64.max).nextDown
+            guard timestampMs.isFinite,
+                  timestampMs >= Double(Int64.min),
+                  timestampMs <= maxTimestamp
+            else {
+                throw BluetoothSdkError(
+                    code: "invalid_timestamp",
+                    message: "setSystemTime timestampMs must be a finite Int64 millisecond timestamp."
+                )
+            }
+            let timestamp = Int64(timestampMs)
+            await MainActor.run {
+                self.bluetoothSdk().setSystemTime(timestampMs: timestamp)
+            }
+        }
+
+        // MARK: - Gallery Commands
+
+        AsyncFunction("setGalleryServerEnabled") { (enabled: Bool) in
+            let sdk = await MainActor.run { self.bluetoothSdk() }
+            return try await sdk.setGalleryServerEnabled(enabled).values
+        }
+
+        AsyncFunction("setTouchGestureDefaultBehaviorEnabled") { (gesture: String, enabled: Bool) in
+            guard let gesture = TouchGesture(rawValue: gesture) else {
+                throw BluetoothSdkError(code: "invalid_touch_gesture", message: "Unknown touch gesture: \(gesture)")
+            }
+            let sdk = await MainActor.run { self.bluetoothSdk() }
+            return try await sdk.setTouchGestureDefaultBehaviorEnabled(gesture, enabled: enabled).values
+        }
+
+        AsyncFunction("setGalleryModeEnabled") { (enabled: Bool) in
+            let sdk = await MainActor.run { self.bluetoothSdk() }
+            return try await sdk.setGalleryModeEnabled(enabled).values
+        }
+
+        AsyncFunction("setVoiceActivityDetectionEnabled") { (enabled: Bool) in
+            let sdk = await MainActor.run { self.bluetoothSdk() }
+            try await sdk.setVoiceActivityDetectionEnabled(enabled)
+        }
+
+        AsyncFunction("setLoudnessGateEnabled") { (enabled: Bool) in
+            let sdk = await MainActor.run { self.bluetoothSdk() }
+            try await sdk.setLoudnessGateEnabled(enabled)
+        }
+
+        AsyncFunction("setAutoPowerOffEnabled") { (enabled: Bool) in
+            let sdk = await MainActor.run { self.bluetoothSdk() }
+            try await sdk.setAutoPowerOffEnabled(enabled)
+        }
+
+        AsyncFunction("setPhotoCaptureDefaults") { (params: [String: Any]) in
+            let sdk = await MainActor.run { self.bluetoothSdk() }
+            return try await sdk.setPhotoCaptureDefaults(PhotoCaptureDefaults.from(params: params)).values
+        }
+
+        AsyncFunction("setVideoRecordingDefaults") { (width: Int, height: Int, fps: Int) in
+            let sdk = await MainActor.run { self.bluetoothSdk() }
+            return try await sdk.setVideoRecordingDefaults(VideoRecordingDefaults(width: width, height: height, fps: fps)).values
+        }
+
+        AsyncFunction("setMaxVideoRecordingDuration") { (minutes: Int) in
+            let sdk = await MainActor.run { self.bluetoothSdk() }
+            return try await sdk.setMaxVideoRecordingDuration(minutes: minutes).values
+        }
+
+        AsyncFunction("setCameraFov") { (fov: [String: Any]) in
+            let value = intValue(fov["fov"]) ?? CameraFov.defaultFov
+            let roiPosition = CameraRoiPosition.from(
+                rawValue: intValue(fov["roiPosition"]) ?? intValue(fov["roi_position"])
+            )
+            let sdk = await MainActor.run { self.bluetoothSdk() }
+            return try await sdk.setCameraFov(CameraFov(fov: value, roiPosition: roiPosition)).values
+        }
+
+        AsyncFunction("setLegacyCameraFov") { (fov: [String: Any]) in
+            let value = intValue(fov["fov"]) ?? CameraFov.defaultFov
+            let roiPosition = CameraRoiPosition.from(
+                rawValue: intValue(fov["roiPosition"]) ?? intValue(fov["roi_position"])
+            )
+            let sdk = await MainActor.run { self.bluetoothSdk() }
+            return try sdk.setLegacyCameraFov(CameraFov(fov: value, roiPosition: roiPosition)).values
+        }
+
+        AsyncFunction("restoreLegacyCameraFov") {
+            let sdk = await MainActor.run { self.bluetoothSdk() }
+            try sdk.restoreLegacyCameraFov()
+        }
+
+        AsyncFunction("setCameraFovOverride") { (params: [String: Any]) in
+            guard let leaseId = params["leaseId"] as? String, !leaseId.isEmpty else {
+                throw BluetoothSdkError(code: "invalid_request", message: "leaseId is required")
+            }
+            let value = intValue(params["fov"]) ?? CameraFov.defaultFov
+            let roiPosition = CameraRoiPosition.from(
+                rawValue: intValue(params["roiPosition"]) ?? intValue(params["roi_position"])
+            )
+            let ttlMs = intValue(params["ttlMs"]) ?? 300_000
+            let sdk = await MainActor.run { self.bluetoothSdk() }
+            return try await sdk.setCameraFovOverride(
+                leaseId: leaseId,
+                fov: CameraFov(fov: value, roiPosition: roiPosition),
+                ttlMs: ttlMs
+            ).values
+        }
+
+        AsyncFunction("releaseCameraFovOverride") { (leaseId: String) in
+            let sdk = await MainActor.run { self.bluetoothSdk() }
+            return try await sdk.releaseCameraFovOverride(leaseId: leaseId).values
+        }
+
+        AsyncFunction("setCameraTuningConfig") { (anrOn: Bool, gainOn: Bool) in
+            let sdk = await MainActor.run { self.bluetoothSdk() }
+            return try await sdk.setCameraTuningConfig(anrOn: anrOn, gainOn: gainOn).values
+        }
+
+        AsyncFunction("queryGalleryStatus") {
+            let sdk = await MainActor.run { self.bluetoothSdk() }
+            return try await sdk.queryGalleryStatus().values
+        }
+
+        AsyncFunction("requestPhoto") { (params: [String: Any]) in
+            let req = try PhotoRequest.from(params: params)
+            Bridge.log(
+                "NATIVE: PHOTO PIPELINE [3/6] BluetoothSdk.requestPhoto requestId=\(req.requestId) size=\(req.size.rawValue) compress=\(req.compress.rawValue) aeDivisor=\(req.aeExposureDivisor.map { String($0) } ?? "nil")"
+            )
+
+            let sdk = await MainActor.run { self.bluetoothSdk() }
+            return try await sdk.requestPhoto(req).values
+        }
+
+        AsyncFunction("warmUpCamera") { (params: [String: Any]) in
+            let requestId = params["requestId"] as? String
+            let sizeRaw = params["size"] as? String ?? "medium"
+            let size = PhotoSize(normalizedRawValue: sizeRaw)
+            let mode = PhotoMode(normalizedRawValue: params["mode"] as? String)
+            let exposureTimeNs: Double?
+            switch params["exposureTimeNs"] {
+            case let value as Double:
+                exposureTimeNs = value.isFinite && value > 0 ? value : nil
+            case let value as Int:
+                exposureTimeNs = value > 0 ? Double(value) : nil
+            case let value as NSNumber:
+                let d = value.doubleValue
+                exposureTimeNs = d.isFinite && d > 0 ? d : nil
+            default:
+                exposureTimeNs = nil
+            }
+            let durationRaw = intValue(params["durationMs"]) ?? 0
+            let durationMs = durationRaw > 0 ? durationRaw : 15000
+            let zsl = params["zsl"] as? Bool
+            let mfnr = params["mfnr"] as? Bool
+
+            let sdk = await MainActor.run { self.bluetoothSdk() }
+            return try await sdk.warmUpCamera(
+                requestId: requestId,
+                size: size,
+                mode: mode,
+                exposureTimeNs: exposureTimeNs,
+                durationMs: durationMs,
+                zsl: zsl,
+                mfnr: mfnr
+            ).values
+        }
+
+        AsyncFunction("stopCameraWarmUp") { (requestId: String) in
+            let sdk = await MainActor.run { self.bluetoothSdk() }
+            try sdk.stopCameraWarmUp(requestId: requestId)
+        }
+
+        // MARK: - OTA Commands
+
+        Function("setOtaVersionUrl") { (otaVersionUrl: String) in
+            try self.readOnMainActor {
+                let sdk = self.bluetoothSdk()
+                try sdk.setOtaVersionUrl(otaVersionUrl)
+            }
+        }
+
+        Function("getOtaVersionUrl") {
+            try self.readOnMainActor {
+                let sdk = self.bluetoothSdk()
+                return try sdk.getOtaVersionUrl()
+            }
+        }
+
+        AsyncFunction("checkForOtaUpdate") {
+            let sdk = await MainActor.run { self.bluetoothSdk() }
+            return try await sdk.checkForOtaUpdate()
+        }
+
+        AsyncFunction("startOtaUpdate") { (otaVersionUrl: String?) in
+            let sdk = await MainActor.run { self.bluetoothSdk() }
+            if let otaVersionUrl, !otaVersionUrl.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return try await sdk.startOtaUpdate(otaVersionUrl: otaVersionUrl).values
+            }
+            return try await sdk.startOtaUpdate().values
+        }
+
+        AsyncFunction("sendOtaQueryStatus") {
+            let sdk = await MainActor.run { self.bluetoothSdk() }
+            return try await sdk.sendOtaQueryStatus().values
+        }
+
+        AsyncFunction("startAr99OtaFromFile") { (path: String) in
+            let sdk = await MainActor.run { self.bluetoothSdk() }
+            return try await MainActor.run { try sdk.startAr99OtaFromFile(path) }
+        }
+
+        AsyncFunction("cancelAr99Ota") {
+            let sdk = await MainActor.run { self.bluetoothSdk() }
+            await MainActor.run { sdk.cancelAr99Ota() }
+        }
+
+        AsyncFunction("sendAr99FactoryReset") {
+            let sdk = await MainActor.run { self.bluetoothSdk() }
+            try await MainActor.run { try sdk.sendAr99FactoryReset() }
+        }
+
+        Function("buildAr99OtaSignature") { (secret: String, appName: String, currentVersion: String, serialNumber: String, nonce: String) in
+            let raw = secret + appName + "juxinOTA" + currentVersion + serialNumber.trimmingCharacters(in: .whitespacesAndNewlines) + nonce
+            let digest = Insecure.MD5.hash(data: Data(raw.utf8))
+            return digest.map { String(format: "%02x", $0) }.joined()
+        }
+
+        // MARK: - Version Info Commands
+
+        // The OTA check asks again after request_timeout, so the code has to reach JS intact.
+        AsyncFunction("requestVersionInfo") {
+            let sdk = await MainActor.run { self.bluetoothSdk() }
+            do {
+                return try await sdk.requestVersionInfo().dictionary
+            } catch let error as BluetoothSdkError {
+                throw codedBridgeError(error)
+            }
+        }
+
+        // MARK: - Power Control Commands
+
+        AsyncFunction("sendShutdown") {
+            await MainActor.run {
+                self.bluetoothSdk().sendShutdown()
+            }
+        }
+
+        AsyncFunction("sendReboot") {
+            await MainActor.run {
+                self.bluetoothSdk().sendReboot()
+            }
+        }
+
+        // MARK: - Video Recording Commands
+
+        AsyncFunction("startVideoRecording") {
+            (requestId: String, save: Bool, sound: Bool, settings: [String: Any]?) in
+            /// Optional per-recording {width,height,fps}. Absent fields stay 0, which
+            /// the glasses treat as "use the saved button-video default". JS numbers
+            /// arrive as Double across the bridge, so coerce to Int.
+            func dim(_ key: String) -> Int {
+                (settings?[key] as? NSNumber)?.intValue ?? 0
+            }
+            let sdk = await MainActor.run { self.bluetoothSdk() }
+            return try await sdk.startVideoRecording(
+                VideoRecordingRequest(
+                    requestId: requestId, save: save, sound: sound,
+                    width: dim("width"), height: dim("height"), fps: dim("fps"),
+                    maxRecordingTimeMinutes: dim("maxRecordingTimeMinutes")
+                )
+            ).values
+        }
+
+        // webhookUrl/authToken are supplied at stop (not start) so the token is
+        // fresh when the upload runs. Empty/nil webhook = keep on device.
+        AsyncFunction("stopVideoRecording") {
+            (requestId: String, webhookUrl: String?, authToken: String?) in
+            let sdk = await MainActor.run { self.bluetoothSdk() }
+            return try await sdk.stopVideoRecording(
+                requestId: requestId, webhookUrl: webhookUrl, authToken: authToken
+            ).values
+        }
+
+        AsyncFunction("queryVideoRecordingStatus") { (requestId: String) in
+            let sdk = await MainActor.run { self.bluetoothSdk() }
+            return try await sdk.queryVideoRecordingStatus(requestId: requestId).values
+        }
+
+        // MARK: - Stream Commands
+
+        AsyncFunction("startStream") { (params: [String: Any]) in
+            let sdk = await MainActor.run { self.bluetoothSdk() }
+            return try await sdk.startStream(StreamRequest(values: params)).values
+        }
+
+        AsyncFunction("stopStream") {
+            let sdk = await MainActor.run { self.bluetoothSdk() }
+            return try await sdk.stopStream().values
+        }
+
+        // MARK: - Audio Playback Monitoring
+
+        AsyncFunction("setOwnAppAudioPlaying") { (playing: Bool) in
+            await MainActor.run {
+                self.bluetoothSdk().setOwnAppAudioPlaying(playing)
+            }
+        }
+
+        // MARK: - Live PCM output stream (miniapp speaker.createStream)
+
+        // jitterMs (default 500, 80-500 as on Android): playback starts once that much audio is
+        // queued, or on close, so a sound shorter than the cushion still plays.
+        AsyncFunction("pcmStreamOpen") {
+            (streamId: String, sampleRate: Int, channels: Int, volume: Double, jitterMs: Int?) async throws in
+            try PcmStreamManager.open(
+                streamId: streamId,
+                sampleRate: sampleRate,
+                channels: channels,
+                volume: Float(volume),
+                jitterMs: jitterMs
+            )
+        }
+
+        AsyncFunction("pcmStreamWrite") {
+            (streamId: String, base64: String) async throws -> [String: Int64] in
+            try ["bufferedMs": await PcmStreamManager.write(streamId: streamId, base64: base64)]
+        }
+
+        AsyncFunction("pcmStreamClose") {
+            (streamId: String) async throws -> [String: Int64] in
+            try ["durationMs": await PcmStreamManager.close(streamId: streamId)]
+        }
+
+        AsyncFunction("pcmStreamAbort") { (streamId: String) async in
+            await PcmStreamManager.abort(streamId: streamId)
+        }
+
+        // Native HTTP GET of raw s16le mono PCM, played as it downloads. Async, so the download
+        // and playback never hold Expo's shared module queue.
+        AsyncFunction("pcmStreamPlayUrl") {
+            (streamId: String, url: String, sampleRate: Int, volume: Double, jitterMs: Int?) async throws -> [String: Int64] in
+            try ["durationMs": await PcmStreamManager.playUrl(
+                streamId: streamId,
+                url: url,
+                sampleRate: sampleRate,
+                volume: Float(volume),
+                jitterMs: jitterMs
+            )]
+        }
+
+        AsyncFunction("getGlassesMediaVolume") { () async throws -> [String: Any] in
+            try await DeviceManager.shared.getGlassesMediaVolume()
+        }
+
+        AsyncFunction("setGlassesMediaVolume") { (level: Int) async throws -> [String: Any] in
+            try await DeviceManager.shared.setGlassesMediaVolume(level: level)
+        }
+
+        // MARK: - RGB LED Control
+
+        AsyncFunction("rgbLedControl") {
+            (
+                requestId: String, packageName: String?, action: String, color: String?,
+                onDurationMs: Int, offDurationMs: Int, count: Int
+            ) in
+            let sdk = await MainActor.run { self.bluetoothSdk() }
+            return try await sdk.rgbLedControl(
+                RgbLedRequest(
+                    requestId: requestId,
+                    packageName: packageName,
+                    action: RgbLedAction(rawValue: action) ?? .off,
+                    color: color.flatMap(RgbLedColor.init(rawValue:)),
+                    onDurationMs: onDurationMs,
+                    offDurationMs: offDurationMs,
+                    count: count
+                )
+            ).values
+        }
+
+        // MARK: - Microphone Commands
+
+        AsyncFunction("setMicState") { (
+            enabled: Bool,
+            useGlassesMic: Bool?,
+            sendTranscript: Bool?,
+            sendLc3Data: Bool?
+        ) in
+            await MainActor.run {
+                self.bluetoothSdk().setMicState(
+                    enabled: enabled,
+                    useGlassesMic: useGlassesMic ?? true,
+                    sendTranscript: sendTranscript ?? false,
+                    sendLc3Data: sendLc3Data ?? false
+                )
+            }
+        }
+
+        /**
+         * Android-only today. Present so a host that pins the microphone for a call does not have
+         * to branch on platform, and so a caller cannot mistake a missing function for a pin that
+         * was taken: the ACS capability gate excludes iOS precisely because this cannot honour it.
+         */
+        AsyncFunction("setMicSourcePin") { (source: String?) in
+            if source != nil {
+                Bridge.log("BluetoothSdkModule: setMicSourcePin(\(source ?? "")) is not implemented on iOS; ignoring")
+            }
+        }
+
+        // Loads the keyword spotter from the Speech-page model directory; disabling releases it.
+        AsyncFunction("setWakeWordDetection") { (enabled: Bool, modelDir: String?) async throws in
+            #if !os(macOS)
+                try await WakeWordDetector.shared.configure(enabled: enabled, modelDir: modelDir)
+            #else
+                if enabled {
+                    throw NSError(domain: "WakeWordDetector", code: 1,
+                                  userInfo: [NSLocalizedDescriptionKey: "Native wake-word detection is not available on macOS"])
+                }
+            #endif
+        }
+
+        AsyncFunction("isSttModelLoaded") { (path: String) async -> Bool in
+            await DeviceManager.shared.isSttModelLoaded(path)
+        }
+
+        // Final text after its local_transcription event was sent, or null. Never throws.
+        AsyncFunction("finishTranscription") { () async -> String? in
+            await DeviceManager.shared.finishTranscription()
+        }
+
+        AsyncFunction("restartTranscriber") { () async throws in
+            guard await DeviceManager.shared.restartTranscriber() else {
+                throw NSError(domain: "SherpaOnnxTranscriber", code: 2,
+                              userInfo: [NSLocalizedDescriptionKey: "Could not load the speech model"])
+            }
+        }
+
+        // Phone-side Silero speech activity on microphone PCM; disabling releases the model.
+        AsyncFunction("setSpeechActivityDetection") { (enabled: Bool, options: [String: Any]?) async throws in
+            #if !os(macOS)
+                let minSilenceMs = (options?["minSilenceMs"] as? NSNumber)?.intValue
+                try await SpeechActivityMonitor.shared.setEnabled(enabled, minSilenceMs: minSilenceMs)
+            #else
+                if enabled {
+                    throw NSError(domain: "SpeechActivity", code: 1,
+                                  userInfo: [NSLocalizedDescriptionKey: "Native speech activity detection is not available on macOS"])
+                }
+            #endif
+        }
+
+        // MARK: - Display Commands
+
+        AsyncFunction("clearDisplay") {
+            let sdk = await MainActor.run { self.bluetoothSdk() }
+            try? await sdk.clearDisplay()
+        }
+
+        // MARK: - STT Model Management
+
+        #if !os(macOS)
+        AsyncFunction("setSttModelDetails") { (path: String, languageCode: String) in
+            STTTools.setSttModelDetails(path, languageCode)
+        }
+
+        AsyncFunction("getSttModelPath") { () -> String in
+            return STTTools.getSttModelPath()
+        }
+
+        AsyncFunction("checkSttModelAvailable") { () -> Bool in
+            return STTTools.checkSTTModelAvailable()
+        }
+
+        AsyncFunction("validateSttModel") { (path: String) -> Bool in
+            return STTTools.validateSTTModel(path)
+        }
+
+        AsyncFunction("extractTarBz2") { (sourcePath: String, destinationPath: String) -> Bool in
+            return STTTools.extractTarBz2(sourcePath: sourcePath, destinationPath: destinationPath)
+        }.runOnQueue(modelExtractionQueue)
+
+        // MARK: - TTS Model Management
+
+        AsyncFunction("setTtsModelDetails") { (path: String, languageCode: String) in
+            TTSTools.setTtsModelDetails(path, languageCode)
+        }
+
+        AsyncFunction("getTtsModelPath") { () -> String in
+            return TTSTools.getTtsModelPath()
+        }
+
+        AsyncFunction("getTtsModelLanguage") { () -> String in
+            return TTSTools.getTtsModelLanguage()
+        }
+
+        AsyncFunction("checkTtsModelAvailable") { () -> Bool in
+            return TTSTools.checkTTSModelAvailable()
+        }
+
+        AsyncFunction("validateTtsModel") { (path: String) -> Bool in
+            return TTSTools.validateTTSModel(path)
+        }
+
+        AsyncFunction("generateTtsAudio") {
+            (text: String, modelPath: String, outputPath: String, speakerId: Int, speed: Double) -> Bool in
+            return TTSTools.generateTtsAudio(
+                text: text,
+                modelPath: modelPath,
+                outputPath: outputPath,
+                speakerId: speakerId,
+                speed: speed
+            )
+        }
+        #endif
+    }
+
+    @MainActor
+    private func bluetoothSdk() -> MentraBluetoothSDK {
+        if let sdk {
+            return sdk
+        }
+
+        let sdk = MentraBluetoothSDK(
+            configuration: MentraBluetoothSDKConfiguration(
+                analytics: BluetoothSdkAnalyticsConfiguration().withSurface("react_native")
+            )
+        )
+        sdk.delegate = self
+        self.sdk = sdk
+        return sdk
+    }
+
+    private func readOnMainActor<T>(_ body: @MainActor () throws -> T) rethrows -> T {
+        if Thread.isMainThread {
+            return try MainActor.assumeIsolated {
+                try body()
+            }
+        }
+
+        return try DispatchQueue.main.sync {
+            try MainActor.assumeIsolated {
+                try body()
+            }
+        }
+    }
+
+    @MainActor
+    public func mentraBluetoothSDK(_ sdk: MentraBluetoothSDK, didUpdateGlasses _: GlassesRuntimeState) {
+        sendEvent("glasses_status", sdk.glassesStatus.dictionary)
+    }
+
+    @MainActor
+    public func mentraBluetoothSDK(_ sdk: MentraBluetoothSDK, didUpdateSdkState _: PhoneSdkRuntimeState) {
+        sendEvent("bluetooth_status", sdk.bluetoothStatus.values)
+    }
+
+    @MainActor
+    public func mentraBluetoothSDK(_: MentraBluetoothSDK, didDiscover device: Device) {
+        sendEvent("device_discovered", device.dictionary)
+    }
+
+    @MainActor
+    public func mentraBluetoothSDK(_: MentraBluetoothSDK, didStopScan reason: ScanStopReason) {
+        guard reason == .completed else { return }
+        let status = bluetoothSdk().bluetoothStatus
+        let deviceModel = status.pendingWearable.isEmpty ? status.defaultWearable : status.pendingWearable
+        sendEvent(
+            "compatible_glasses_search_stop",
+            [
+                "type": "compatible_glasses_search_stop",
+                "deviceModel": deviceModel,
+            ]
+        )
+    }
+
+    @MainActor
+    public func mentraBluetoothSDK(_: MentraBluetoothSDK, didReceive event: BluetoothEvent) {
+        switch event {
+        case let .buttonPress(button):
+            sendEvent(
+                "button_press",
+                [
+                    "buttonId": button.buttonId,
+                    "pressType": button.pressType,
+                    "timestamp": button.timestamp ?? Int(Date().timeIntervalSince1970 * 1000),
+                ]
+            )
+        case let .touch(touch):
+            sendEvent("touch_event", touch.values)
+        case let .voiceActivityDetectionStatus(status):
+            sendEvent("voice_activity_detection_status", status.values)
+        case let .speakingStatus(status):
+            sendEvent("speaking_status", status.values)
+        case let .micHealth(health):
+            sendEvent("mic_health", health.values)
+        case let .wifiStatus(status):
+            sendEvent("wifi_status_change", status.values)
+        case let .hotspotStatus(status):
+            sendEvent("hotspot_status_change", status.values)
+        case let .hotspotError(error):
+            sendEvent("hotspot_error", error.values)
+        case let .photoResponse(response):
+            sendEvent("photo_response", response.values)
+        case let .photoStatus(status):
+            sendEvent("photo_status", status.values)
+        case let .cameraStatus(status):
+            sendEvent("camera_status", status.values)
+        case let .videoRecordingStatus(status):
+            sendEvent("video_recording_status", status.values)
+        case let .mediaUpload(event):
+            sendEvent(event.type, event.values)
+        case let .rgbLedControlResponse(response):
+            sendEvent("rgb_led_control_response", response.values)
+        case let .streamStatus(status):
+            sendEvent("stream_status", status.values)
+        case let .keepAliveAck(ack):
+            sendEvent("keep_alive_ack", ack.values)
+        case let .otaStartAck(event):
+            sendEvent("ota_start_ack", event.values)
+        case let .otaStatus(event):
+            sendEvent("ota_status", event.values)
+        case let .besCrashDetected(event):
+            sendEvent("bes_crash_detected", event.values)
+        case let .settingsAck(event):
+            sendEvent("settings_ack", event.values)
+        case let .versionInfo(event):
+            var values = event.dictionary
+            values["type"] = "version_info"
+            sendEvent("version_info", values)
+        case let .localTranscription(transcription):
+            sendEvent("local_transcription", transcription.values)
+        case let .raw(name, values):
+            sendEvent(name, values)
+        }
+    }
+
+    @MainActor
+    public func mentraBluetoothSDK(_: MentraBluetoothSDK, didReceiveMicPcm event: MicPcmEvent) {
+        sendEvent("mic_pcm", event.values)
+    }
+
+    @MainActor
+    public func mentraBluetoothSDK(_: MentraBluetoothSDK, didReceiveMicLc3 event: MicLc3Event) {
+        sendEvent("mic_lc3", event.values)
+    }
+
+    @MainActor
+    public func mentraBluetoothSDK(_: MentraBluetoothSDK, didChangeDefaultDevice device: Device?) {
+        var event: [String: Any] = [:]
+        if let device {
+            event["device"] = device.dictionary
+        }
+        sendEvent("default_device_changed", event)
+    }
+
+    @MainActor
+    public func mentraBluetoothSDK(_: MentraBluetoothSDK, didLog message: String) {
+        sendEvent("log", ["message": message])
+    }
+
+    @MainActor
+    public func mentraBluetoothSDK(_: MentraBluetoothSDK, didFail error: BluetoothSdkError) {
+        var body: [String: Any] = ["error": error.message]
+        if let failureCode = error.failureCode { body["code"] = failureCode }
+        sendEvent("pair_failure", body)
+    }
+}
+
+private extension Device {
+    init?(dictionary values: [String: Any]?) {
+        guard let values else { return nil }
+        guard let model = values["model"] as? String ?? values["deviceModel"] as? String else { return nil }
+        guard let name = values["name"] as? String ?? values["deviceName"] as? String else { return nil }
+        let identifier = values["address"] as? String ?? values["deviceAddress"] as? String
+        let rssi: Int?
+        switch values["rssi"] {
+        case let value as Int:
+            rssi = value
+        case let value as Double:
+            rssi = Int(value)
+        case let value as NSNumber:
+            rssi = value.intValue
+        default:
+            rssi = nil
+        }
+        let id = values["id"] as? String
+        self.init(
+            model: DeviceModel.fromDeviceType(model),
+            name: name,
+            identifier: identifier?.isEmpty == true ? nil : identifier,
+            rssi: rssi,
+            id: id
+        )
+    }
+}
+
+private extension ConnectOptions {
+    init(dictionary values: [String: Any]?) {
+        self.init(
+            saveAsDefault: values?["saveAsDefault"] as? Bool ?? true,
+            cancelExistingConnectionAttempt: values?["cancelExistingConnectionAttempt"] as? Bool ?? true,
+            requiresAncs: values?["requiresAncs"] as? Bool ?? true,
+            enableTransportBridging: values?["enableTransportBridging"] as? Bool ?? true
+        )
+    }
+}

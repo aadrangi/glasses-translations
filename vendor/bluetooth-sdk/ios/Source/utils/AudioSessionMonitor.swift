@@ -1,0 +1,488 @@
+//
+//  AudioSessionMonitor.swift
+//  AOS
+//
+//  Monitors iOS AVAudioSession for Bluetooth audio device connections
+//  Used to detect when Mentra Live glasses are paired/connected for audio
+//
+
+import Foundation
+
+#if !os(macOS)
+import AVFoundation
+import OSLog
+import UIKit
+
+class AudioSessionMonitor {
+    private static let readinessLog = Logger(subsystem: "com.mentra.bluetooth-sdk", category: "AudioReadiness")
+    /// Singleton instance
+    private static var instance: AudioSessionMonitor?
+
+    // Current monitoring state
+    static var isMonitoring = false
+    static var devicePattern: String?
+    static var callback: ((Bool, String?) -> Void)?
+    /// Last pair-audio decision line. The check runs on a timer; log only changes.
+    private static var lastPairFlow = ""
+    /// SoloAmbient hides paired HFP inputs. One short category probe per second is enough.
+    private static var lastBluetoothProbe: (at: Date, outputs: [AVAudioSessionPortDescription], inputs: [AVAudioSessionPortDescription]?)?
+    /// The glasses sent `classic_link` in the current BLE session. Their report replaces the
+    /// category probe, which can see a route that is not the glasses'. Old firmware never sends
+    /// it and keeps the probe.
+    static var glassesReportClassicLink = false
+
+    private init() {
+        Bridge.log("AudioMonitor: Initialized")
+    }
+
+    static func getInstance() -> AudioSessionMonitor {
+        if instance == nil {
+            instance = AudioSessionMonitor()
+        }
+        return instance!
+    }
+
+    /// Check if AVAudioSession is configured for Bluetooth
+    /// Returns true if session allows Bluetooth audio
+    /// NOTE: We don't configure the session - PhoneMic.swift handles that when recording
+    static func isAudioSessionConfigured() -> Bool {
+        let session = AVAudioSession.sharedInstance()
+
+        // Check if category supports Bluetooth
+        let category = session.category
+        let supportsBluetooth =
+            category == .playAndRecord || category == .record || category == .multiRoute
+
+        Bridge.log(
+            "AudioMonitor: Audio session category: \(category.rawValue), supports BT: \(supportsBluetooth)"
+        )
+        return supportsBluetooth
+    }
+
+    /// Check if a Bluetooth audio device matching the pattern is currently the active audio route
+    /// Returns true if device is actively routing audio
+    static func isAudioDeviceConnected(devicePattern: String) -> Bool {
+        let session = AVAudioSession.sharedInstance()
+        let outputs = session.currentRoute.outputs
+
+        Bridge.log("AudioMonitor: Checking active route, output count: \(outputs.count)")
+        for output in outputs {
+            Bridge.log("AudioMonitor:   - \(output.portName) (type: \(output.portType.rawValue))")
+            if BluetoothAudioRoute.matches(
+                name: output.portName,
+                portType: output.portType.rawValue,
+                target: devicePattern,
+                isIOSAppOnMac: ProcessInfo.processInfo.isiOSAppOnMac
+            ) {
+                Bridge.log("AudioMonitor: ✅ Found active audio device: \(output.portName)")
+                return true
+            }
+        }
+
+        Bridge.log("AudioMonitor: No active audio device matching '\(devicePattern)'")
+        return false
+    }
+
+    static func isOtherAudioDeviceConnected(devicePattern: String) -> Bool {
+        let connected = isAudioDeviceConnected(devicePattern: devicePattern)
+        if connected {
+            return false
+        }
+
+        // do we have multiple devices connected?
+        let session = AVAudioSession.sharedInstance()
+        let outputs = session.currentRoute.outputs
+
+        Bridge.log("AudioMonitor: Checking active route, output count: \(outputs.count)")
+        if outputs.count > 1 {
+            return true
+        }
+
+        return false
+    }
+
+    private struct BluetoothSessionSnapshot {
+        let categoryLabel: String
+        let outputs: [AVAudioSessionPortDescription]
+        let availableInputs: [AVAudioSessionPortDescription]?
+    }
+
+    /// The default SoloAmbient session lists only the built-in mic, so glasses that are
+    /// already connected in Settings look absent and pairing waits out the auto-audio timer.
+    /// Read HFP inputs with a category that can see them, then put the previous category back.
+    /// Does not activate the session or select an input.
+    private static func bluetoothSessionSnapshot() -> BluetoothSessionSnapshot {
+        if !Thread.isMainThread {
+            return DispatchQueue.main.sync { bluetoothSessionSnapshot() }
+        }
+        let session = AVAudioSession.sharedInstance()
+        if categoryShowsBluetoothInputs(session.category) {
+            return BluetoothSessionSnapshot(
+                categoryLabel: session.category.rawValue,
+                outputs: session.currentRoute.outputs,
+                availableInputs: session.availableInputs
+            )
+        }
+        if glassesReportClassicLink {
+            // Passive route observation only: never switch the category.
+            return BluetoothSessionSnapshot(
+                categoryLabel: "passive:\(session.category.rawValue)",
+                outputs: session.currentRoute.outputs,
+                availableInputs: session.availableInputs
+            )
+        }
+        if let lastBluetoothProbe, Date().timeIntervalSince(lastBluetoothProbe.at) < 1 {
+            return BluetoothSessionSnapshot(
+                categoryLabel: "probed:\(AVAudioSession.Category.playAndRecord.rawValue)",
+                outputs: lastBluetoothProbe.outputs,
+                availableInputs: lastBluetoothProbe.inputs
+            )
+        }
+        let savedCategory = session.category
+        let savedMode = session.mode
+        let savedOptions = session.categoryOptions
+        do {
+            try session.setCategory(
+                .playAndRecord, mode: .default, options: [.allowBluetooth, .allowBluetoothA2DP]
+            )
+        } catch {
+            return BluetoothSessionSnapshot(
+                categoryLabel: session.category.rawValue,
+                outputs: session.currentRoute.outputs,
+                availableInputs: session.availableInputs
+            )
+        }
+        let outputs = session.currentRoute.outputs
+        let inputs = session.availableInputs
+        lastBluetoothProbe = (Date(), outputs, inputs)
+        try? session.setCategory(savedCategory, mode: savedMode, options: savedOptions)
+        return BluetoothSessionSnapshot(
+            categoryLabel: "probed:\(AVAudioSession.Category.playAndRecord.rawValue)",
+            outputs: outputs,
+            availableInputs: inputs
+        )
+    }
+
+    private static func categoryShowsBluetoothInputs(_ category: AVAudioSession.Category) -> Bool {
+        category == .playAndRecord || category == .record || category == .multiRoute
+    }
+
+    /// Glasses' Classic audio facts without selecting an input or activating the session.
+    /// `profilesConnected` matches `isDevicePaired`; `audioRouted` is the stricter
+    /// "audio is flowing to the glasses" signal.
+    static func observeProfiles(devicePattern: String) -> BluetoothAudioRoute.ProfileObservation {
+        let snapshot = bluetoothSessionSnapshot()
+        let profiles = profileObservation(
+            devicePattern: devicePattern, outputs: snapshot.outputs, availableInputs: snapshot.availableInputs
+        )
+        logPairFlow(
+            category: snapshot.categoryLabel, devicePattern: devicePattern, outputs: snapshot.outputs,
+            availableInputs: snapshot.availableInputs, profiles: profiles
+        )
+        return profiles
+    }
+
+    private static func profileObservation(
+        devicePattern: String,
+        outputs: [AVAudioSessionPortDescription],
+        availableInputs: [AVAudioSessionPortDescription]?
+    ) -> BluetoothAudioRoute.ProfileObservation {
+        BluetoothAudioRoute.observeProfiles(
+            outputs: outputs.map { (name: $0.portName, portType: $0.portType.rawValue) },
+            inputs: availableInputs?.map { (name: $0.portName, portType: $0.portType.rawValue) },
+            target: devicePattern, isIOSAppOnMac: ProcessInfo.processInfo.isiOSAppOnMac
+        )
+    }
+
+    /// One PAIRFLOW line per transition of category, inputs availability, ports, and both facts.
+    /// Port names are the glasses' advertised name or other audio devices; no credentials are logged.
+    private static func logPairFlow(
+        category: String,
+        devicePattern: String,
+        outputs: [AVAudioSessionPortDescription],
+        availableInputs: [AVAudioSessionPortDescription]?,
+        profiles: BluetoothAudioRoute.ProfileObservation
+    ) {
+        let decision = profiles.audioRouted
+            ? "advance_active_output"
+            : (profiles.profilesConnected ? "advance_hfp_input" : "wait_no_route")
+        let outputNames = outputs.map { "\($0.portType.rawValue):\($0.portName)" }.joined(separator: ",")
+        let inputNames = (availableInputs ?? []).map { "\($0.portType.rawValue):\($0.portName)" }.joined(separator: ",")
+        let pairFlow =
+            "PAIRFLOW: pair_audio decision=\(decision) pattern=\(devicePattern) category=\(category) inputsNil=\(availableInputs == nil) outputs=[\(outputNames)] inputs=[\(inputNames)] profilesConnected=\(profiles.profilesConnected) audioRouted=\(profiles.audioRouted)"
+        if pairFlow != lastPairFlow {
+            lastPairFlow = pairFlow
+            Bridge.log(pairFlow)
+        }
+    }
+
+    /// Check if a Bluetooth device matching the pattern is paired (appears in availableInputs)
+    /// Returns true if device is found (paired), WITHOUT activating it
+    /// This avoids switching A2DP music playback to HFP microphone mode
+    static func isDevicePaired(devicePattern: String) -> Bool {
+        let snapshot = bluetoothSessionSnapshot()
+        let outputs = snapshot.outputs
+        let route = BluetoothAudioRoute.observe(
+            outputs: outputs.map { (name: $0.portName, portType: $0.portType.rawValue) },
+            target: devicePattern, isIOSAppOnMac: ProcessInfo.processInfo.isiOSAppOnMac
+        )
+        let activeTarget = route.matchingOutputCount > 0
+        let availableInputs = snapshot.availableInputs
+        let profiles = profileObservation(devicePattern: devicePattern, outputs: outputs, availableInputs: availableInputs)
+        let bluetoothInput = availableInputs?.first { input in
+            input.portType == .bluetoothHFP
+                && input.portName.localizedCaseInsensitiveContains(devicePattern)
+        }
+
+        // NSLog messages redact the native route checks in retained Mac logs.
+        // Keep categorical evidence at notice level without exposing names or
+        // selecting an input or activating the session.
+        readinessLog.notice("Pair audio: iosOnMac=\(ProcessInfo.processInfo.isiOSAppOnMac, privacy: .public) targetPresent=\(!devicePattern.isEmpty, privacy: .public) category=\(snapshot.categoryLabel, privacy: .public) outputs=\(outputs.count, privacy: .public) bluetoothOutputs=\(route.bluetoothOutputCount, privacy: .public) targetNameOutputs=\(route.targetNameOutputCount, privacy: .public) inputs=\(availableInputs?.count ?? -1, privacy: .public) activeTarget=\(activeTarget, privacy: .public) hfpTarget=\(bluetoothInput != nil, privacy: .public)")
+        logPairFlow(
+            category: snapshot.categoryLabel, devicePattern: devicePattern, outputs: outputs,
+            availableInputs: availableInputs, profiles: profiles
+        )
+
+        // Check if already active (using A2DP for music or HFP for calls)
+        if activeTarget {
+            Bridge.log("AudioMonitor: Device '\(devicePattern)' already active")
+            return true
+        }
+
+        // Try to find in availableInputs (includes paired devices)
+        guard let availableInputs else {
+            Bridge.log("AudioMonitor: ❌ availableInputs is nil")
+            return false
+        }
+
+        Bridge.log("AudioMonitor: availableInputs count: \(availableInputs.count)")
+        for input in availableInputs {
+            Bridge.log("AudioMonitor:   - \(input.portName) (type: \(input.portType.rawValue))")
+        }
+
+        if let btInput = bluetoothInput {
+            Bridge.log(
+                "AudioMonitor: ✅ Found paired device '\(btInput.portName)' (not activating to preserve A2DP)"
+            )
+            return true
+        } else {
+            Bridge.log(
+                "AudioMonitor: ❌ Bluetooth HFP device '\(devicePattern)' not found in availableInputs"
+            )
+            return false
+        }
+    }
+
+    /// Start monitoring for audio route changes
+    /// Callback will be called when device matching pattern connects/disconnects
+    static func startMonitoring(devicePattern: String, callback: @escaping (Bool, String?) -> Void) {
+        guard !isMonitoring else {
+            Bridge.log("AudioMonitor: Already monitoring")
+            return
+        }
+
+        self.devicePattern = devicePattern
+        self.callback = callback
+
+        // Register for route change notifications
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleRouteChange),
+            name: AVAudioSession.routeChangeNotification,
+            object: nil
+        )
+
+        // Register for app foreground notifications
+        // This handles the case where user pairs in Settings and returns to app
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleAppBecameActive),
+            name: UIApplication.didBecomeActiveNotification,
+            object: nil
+        )
+
+        isMonitoring = true
+        Bridge.log("AudioMonitor: Started monitoring for '\(devicePattern)'")
+    }
+
+    /// Stop monitoring for audio route changes
+    static func stopMonitoring() {
+        guard isMonitoring else {
+            Bridge.log("AudioMonitor: Not currently monitoring")
+            return
+        }
+
+        NotificationCenter.default.removeObserver(
+            self,
+            name: AVAudioSession.routeChangeNotification,
+            object: nil
+        )
+
+        NotificationCenter.default.removeObserver(
+            self,
+            name: UIApplication.didBecomeActiveNotification,
+            object: nil
+        )
+
+        AudioSessionMonitor.isMonitoring = false
+        AudioSessionMonitor.devicePattern = nil
+        AudioSessionMonitor.callback = nil
+
+        Bridge.log("AudioMonitor: Stopped monitoring")
+    }
+
+    @objc private func handleRouteChange(notification: Notification) {
+        guard let userInfo = notification.userInfo,
+              let reasonValue = userInfo[AVAudioSessionRouteChangeReasonKey] as? UInt,
+              let reason = AVAudioSession.RouteChangeReason(rawValue: reasonValue),
+              let pattern = AudioSessionMonitor.devicePattern
+        else {
+            return
+        }
+
+        Bridge.log("AudioMonitor: Route change detected: \(reason.rawValue)")
+
+        switch reason {
+        case .newDeviceAvailable:
+            // When a new device becomes available, try to set it as preferred
+            // This handles the case where user pairs in Settings and returns to app
+            Bridge.log("AudioMonitor: New device available, attempting to activate '\(pattern)'")
+
+            // Add small delay to let iOS populate availableInputs
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                if AudioSessionMonitor.isDevicePaired(devicePattern: pattern) {
+                    let session = AVAudioSession.sharedInstance()
+                    let deviceName = session.availableInputs?.first(where: {
+                        $0.portName.localizedCaseInsensitiveContains(pattern)
+                    })?.portName
+                    Bridge.log(
+                        "AudioMonitor: ✅ Successfully detected newly paired device '\(pattern)'"
+                    )
+                    AudioSessionMonitor.callback?(true, deviceName)
+                } else {
+                    Bridge.log("AudioMonitor: New device available but not matching '\(pattern)'")
+                }
+            }
+
+        case .oldDeviceUnavailable:
+            // Check if our device disconnected
+            if !AudioSessionMonitor.isAudioDeviceConnected(devicePattern: pattern) {
+                Bridge.log("AudioMonitor: Device '\(pattern)' disconnected")
+                AudioSessionMonitor.callback?(false, nil)
+            }
+
+        default:
+            break
+        }
+    }
+
+    @objc private static func handleAppBecameActive() {
+        guard let pattern = AudioSessionMonitor.devicePattern else { return }
+
+        Bridge.log("AudioMonitor: App became active, checking for paired device '\(pattern)'")
+
+        // Don't reconfigure session - it's already configured from when monitoring started
+        // Just wait a bit for iOS to update availableInputs after returning from background
+        // iOS needs time to populate availableInputs after app foreground
+        // Use retry with progressive delays: 100ms, 400ms, 500ms = 1s total
+        AudioSessionMonitor.attemptActivateDevice(pattern: pattern, attempt: 0, maxAttempts: 3)
+    }
+
+    /// Try to detect if the audio device is paired with retry logic
+    /// Delays: [100ms, 400ms, 500ms] = 1 second total
+    static func attemptActivateDevice(pattern: String, attempt: Int, maxAttempts: Int) {
+        // Progressive delays in seconds (total: 1 second)
+        let delays: [TimeInterval] = [0.1, 0.4, 0.5]
+
+        if attempt >= maxAttempts {
+            Bridge.log(
+                "AudioMonitor: ❌ Failed to find paired device '\(pattern)' after \(maxAttempts) attempts"
+            )
+            return
+        }
+
+        let delay = attempt < delays.count ? delays[attempt] : 0.5
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+            Bridge.log(
+                "AudioMonitor: Attempt \(attempt + 1)/\(maxAttempts) to detect '\(pattern)'..."
+            )
+
+            if AudioSessionMonitor.isDevicePaired(devicePattern: pattern) {
+                let session = AVAudioSession.sharedInstance()
+                // Try to get device name from availableInputs
+                let deviceName = session.availableInputs?.first(where: {
+                    $0.portName.localizedCaseInsensitiveContains(pattern)
+                })?.portName
+                Bridge.log("AudioMonitor: ✅ Found paired device on attempt \(attempt + 1)")
+                AudioSessionMonitor.callback?(true, deviceName)
+            } else {
+                Bridge.log(
+                    "AudioMonitor: Attempt \(attempt + 1) failed, retrying in \(delays[min(attempt + 1, delays.count - 1)])s..."
+                )
+                AudioSessionMonitor.attemptActivateDevice(
+                    pattern: pattern, attempt: attempt + 1, maxAttempts: maxAttempts
+                )
+            }
+        }
+    }
+}
+#endif
+
+/// AVAudioSession preserves the route name on iOS-on-Mac but reports the
+/// CoreAudio transport "Bluetooth" instead of iPhone's profile-specific port.
+enum BluetoothAudioRoute {
+    struct Observation: Equatable {
+        let bluetoothOutputCount: Int
+        let targetNameOutputCount: Int
+        let matchingOutputCount: Int
+    }
+
+    static func observe(outputs: [(name: String, portType: String)], target: String, isIOSAppOnMac: Bool) -> Observation {
+        Observation(
+            bluetoothOutputCount: outputs.filter { isBluetoothTransport($0.portType, isIOSAppOnMac: isIOSAppOnMac) }.count,
+            targetNameOutputCount: outputs.filter { matchesName($0.name, target: target) }.count,
+            matchingOutputCount: outputs.filter {
+                matches(name: $0.name, portType: $0.portType, target: target, isIOSAppOnMac: isIOSAppOnMac)
+            }.count
+        )
+    }
+
+    /// Separate facts about the glasses' Classic audio link. Neither implies a bond:
+    /// a bonded device with no connected audio profile is invisible to AVAudioSession.
+    struct ProfileObservation: Equatable {
+        /// An HFP input is available, or a matching Bluetooth output is active.
+        let profilesConnected: Bool
+        /// A matching Bluetooth output is the active route (A2DP or HFP).
+        let audioRouted: Bool
+    }
+
+    /// `inputs` is nil when `AVAudioSession.availableInputs` is nil (it depends on the session category).
+    static func observeProfiles(
+        outputs: [(name: String, portType: String)],
+        inputs: [(name: String, portType: String)]?,
+        target: String,
+        isIOSAppOnMac: Bool
+    ) -> ProfileObservation {
+        let audioRouted = outputs.contains {
+            matches(name: $0.name, portType: $0.portType, target: target, isIOSAppOnMac: isIOSAppOnMac)
+        }
+        let hfpInput = inputs?.contains {
+            $0.portType == "BluetoothHFP" && matchesName($0.name, target: target)
+        } ?? false
+        return ProfileObservation(profilesConnected: audioRouted || hfpInput, audioRouted: audioRouted)
+    }
+
+    static func matches(name: String, portType: String, target: String, isIOSAppOnMac: Bool) -> Bool {
+        matchesName(name, target: target) && isBluetoothTransport(portType, isIOSAppOnMac: isIOSAppOnMac)
+    }
+
+    private static func matchesName(_ name: String, target: String) -> Bool {
+        !target.isEmpty && name.localizedCaseInsensitiveContains(target)
+    }
+
+    private static func isBluetoothTransport(_ portType: String, isIOSAppOnMac: Bool) -> Bool {
+        return portType == "BluetoothHFP" || portType == "BluetoothA2DPOutput"
+            || (isIOSAppOnMac && portType == "Bluetooth")
+    }
+}
