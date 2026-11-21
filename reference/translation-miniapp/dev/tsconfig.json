@@ -1,0 +1,20 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "types": ["bun"],
+    "strict": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "jsx": "react-jsx",
+    "paths": {
+      "@mentra/miniapp": ["../../packages/miniapp/src/index.ts"],
+      "@mentra/miniapp/*": ["../../packages/miniapp/src/*"]
+    }
+  },
+  "include": ["**/*"]
+}

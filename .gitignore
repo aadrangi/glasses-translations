@@ -6,3 +6,9 @@ build/
 DerivedData/
 *.xcuserstate
 Models/
+
+# XcodeGen-generated artifacts (edit app/project.yml instead)
+app/GlassesTranslations.xcodeproj/
+app/Info.plist
+app/build/
+app/*.xcworkspace/

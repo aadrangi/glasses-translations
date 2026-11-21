@@ -3,7 +3,8 @@
   "private": true,
   "description": "Local island-runtime port of the MentraOS Live Translation app",
   "scripts": {
-    "typecheck": "tsc --noEmit -p tsconfig.json"
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "dev": "bun dev/server.ts"
   },
   "dependencies": {
     "@mentra/miniapp": "workspace:*",

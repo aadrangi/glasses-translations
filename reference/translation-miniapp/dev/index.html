@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+    <title>Translation (dev mock)</title>
+    <link rel="stylesheet" href="./index.css" />
+  </head>
+  <body>
+    <div id="root"></div>
+    <!-- Module scripts run in order: mock bridge must exist before main.tsx evaluates. -->
+    <script type="module" src="./mock-host.ts"></script>
+    <script type="module" src="../src/ui/main.tsx"></script>
+  </body>
+</html>

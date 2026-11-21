@@ -1,0 +1,9 @@
+# CocoaPods integration for the app. Run after `xcodegen generate`.
+platform :ios, '18.0'
+
+target 'app' do
+  use_frameworks!
+  # G1-only pruned SDK (see UPSTREAM.md). Pulls SWCompression ~> 4.8.0 and
+  # onnxruntime-objc 1.18.0; the sherpa-onnx xcframework is vendored in-tree.
+  pod 'MentraBluetoothSDK', path: '../vendor/bluetooth-sdk/ios'
+end
