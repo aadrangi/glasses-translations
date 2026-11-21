@@ -3,6 +3,8 @@
 Standalone-project seed for an iPhone app that translates speech locally onto
 Even Realities G1 glasses — no Mentra cloud, no server.
 
+- `AGENTS.md` — handover notes for the next agent session (environment,
+  commands, rules). Read it first if you are an agent.
 - `UPSTREAM.md` — provenance (MentraOS commit, Apache-2.0) + re-sync notes
 - `docs/pipeline-map.md` — what every component does and what to reuse vs build
 - `vendor/bluetooth-sdk/` — Mentra Bluetooth SDK iOS sources: the G1 BLE driver
