@@ -12,3 +12,4 @@ app/GlassesTranslations.xcodeproj/
 app/Info.plist
 app/build/
 app/*.xcworkspace/
+reference/translation-miniapp/dev/dist/
