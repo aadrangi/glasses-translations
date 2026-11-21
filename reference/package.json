@@ -1,0 +1,31 @@
+{
+  "name": "glasses-translations-reference",
+  "private": true,
+  "description": "Self-contained reference workspace: Mentra miniapp SDK, Bluetooth SDK TS layer, engine display/STT wiring, and the Translation miniapp. Imports resolve without the MentraOS monorepo.",
+  "workspaces": [
+    "packages/*",
+    "translation-miniapp"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@dr.pogodin/react-native-fs": "2.38.2",
+    "@react-native-community/netinfo": "11.5.2",
+    "eventemitter3": "^5.0.1",
+    "expo-file-system": "~55.0.20",
+    "react": "19.2.0",
+    "react-dom": "19.2.0",
+    "react-native": "0.83.6",
+    "react-native-localize": "^3.7.0",
+    "react-native-mmkv": "4.0.0",
+    "typesafe-ts": "^1.7.1",
+    "zustand": "^5.0.11"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.0",
+    "@types/react": "~19.2.14",
+    "@types/react-dom": "^19.1.6",
+    "typescript": "^6.0.2"
+  }
+}

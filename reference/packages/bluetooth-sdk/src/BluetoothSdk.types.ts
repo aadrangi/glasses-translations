@@ -1,0 +1,2072 @@
+import type {PhotoCompression} from "@mentra/cloud-protocol/photo-compression"
+export type {PhotoCompression} from "@mentra/cloud-protocol/photo-compression"
+
+// Bluetooth SDK Event Types
+export type GlassesNotReadyEvent = {
+  type: "glasses_not_ready"
+  message: string
+}
+
+// NOTE: unlike most events below, the native module does NOT include a `type`
+// field on the button_press payload 闂?it sends only {buttonId, pressType,
+// timestamp} (see BluetoothSdkModule on both iOS and Android). Consumers must
+// filter on `pressType` / the "button_press" listener name, never `event.type`.
+export type ButtonPressEvent = {
+  buttonId: string
+  pressType: "long" | "short"
+  timestamp: number
+}
+
+export type TouchEvent = {
+  type: "touch_event"
+  deviceModel: DeviceModel
+  gestureName: string
+  timestamp: number
+}
+
+export type AccelEvent = {
+  type: "accel_event"
+  x: number
+  y: number
+  z: number
+  timestamp: number
+}
+
+export type HeadUpEvent = {
+  up: boolean
+}
+
+export type VoiceActivityDetectionStatusEvent = {
+  type: "voice_activity_detection_status"
+  voiceActivityDetectionEnabled: boolean
+}
+
+export const DEFAULT_VOICE_ACTIVITY_DETECTION_ENABLED = false
+
+export type SpeakingStatusEvent = {
+  type: "speaking_status"
+  speaking: boolean
+  timestamp: number
+}
+
+export type BatteryStatusEvent = {
+  type: "battery_status"
+  level: number
+  charging: boolean
+  timestamp: number
+}
+
+export type GlassesConnectionStatus =
+  | {state: "disconnected"}
+  | {state: "scanning"}
+  | {state: "connecting"}
+  | {state: "bonding"}
+  | {state: "connected"; fullyBooted: boolean}
+
+export type ConnectedGlassesConnectionStatus = Extract<GlassesConnectionStatus, {state: "connected"}>
+
+export function isConnectedGlassesConnectionStatus(
+  status: GlassesConnectionStatus,
+): status is ConnectedGlassesConnectionStatus {
+  return status.state === "connected"
+}
+
+export function isReadyGlassesConnectionStatus(status: GlassesConnectionStatus): boolean {
+  return status.state === "connected" && status.fullyBooted
+}
+
+export function isBusyGlassesConnectionStatus(status: GlassesConnectionStatus): boolean {
+  return status.state === "scanning" || status.state === "connecting" || status.state === "bonding"
+}
+
+export function createDisconnectedGlassesStatus(): Partial<GlassesStatus> {
+  return {
+    connection: {state: "disconnected"},
+    g2MissingArm: null,
+    hotspot: {state: "disabled"},
+    voiceActivityDetectionEnabled: DEFAULT_VOICE_ACTIVITY_DETECTION_ENABLED,
+    wifi: {state: "disconnected"},
+  }
+}
+
+/** K900 `sr_getvol` response (Mentra Live glasses media step volume 0闂?5). */
+export type GlassesMediaVolumeGetResult = {
+  level: number
+  statusCode: number
+}
+
+/** K900 `sr_vol` acknowledgment. */
+export type GlassesMediaVolumeSetResult = {
+  statusCode: number
+}
+
+/** On-device keyword spotter state and detections. Describes only the wake-word model. */
+export type WakeWordEvent = {
+  kind: "loading" | "ready" | "detected" | "error"
+  phrase: string
+  /** Unix epoch milliseconds. */
+  timestamp: number
+  message?: string
+}
+
+/**
+ * Phone-side speech activity from the on-device Silero detector
+ * ([setSpeechActivityDetection]). Sent on transitions only. A gap in incoming
+ * microphone audio counts as silence.
+ */
+export type SpeechActivityEvent = {
+  speaking: boolean
+  /** 0 while speaking; on a silence transition, how long the audio has been silent. */
+  silentForMs: number
+  /** Unix epoch milliseconds. */
+  timestamp: number
+}
+
+export type LocalTranscriptionEvent = {
+  text: string
+  isFinal?: boolean
+  transcribeLanguage?: string
+}
+
+export type LogEvent = {
+  message: string
+}
+
+export type WifiStatus = {state: "disconnected"} | {state: "connected"; ssid: string; localIp?: string}
+
+export type ConnectedWifiStatus = Extract<WifiStatus, {state: "connected"}>
+
+export function isConnectedWifiStatus(status: WifiStatus): status is ConnectedWifiStatus {
+  return status.state === "connected"
+}
+
+export type WifiStatusChangeEvent = WifiStatus & {
+  type: "wifi_status_change"
+  /**
+   * Glasses-reported provisioning failure reason when THIS event is the verdict of a
+   * failed connect attempt; absent on routine link-state updates. An attempt property,
+   * not a link property 闂?which is why it lives on the event, not on WifiStatus:
+   * "connect_timeout" arrives on a disconnected status (never associated), while
+   * "connected_to_other_network" arrives on a *connected* status (the attempt failed
+   * and the glasses ended up on / fell back to a different SSID than requested).
+   * Requires ASG client v40+ 闂?older glasses never send it.
+   */
+  error?: string
+}
+
+export type WifiForgetOutcome =
+  | "confirmed"
+  | "dispatched"
+  | "not_found"
+  | "unsupported"
+  | "failed"
+  | "legacy_unverified"
+
+export type WifiForgetResult = {
+  ssid: string
+  outcome: WifiForgetOutcome
+  connected?: boolean
+  currentSsid?: string
+  localIp?: string
+  error?: string
+}
+
+export type ModernWifiForgetResultEvent = {
+  type: "wifi_forget_result"
+  mode: "modern"
+  requestId: string
+  sid: string
+  ssid: string
+  protocolVersion: number
+  outcome: Exclude<WifiForgetOutcome, "legacy_unverified">
+  connected?: boolean
+  currentSsid?: string
+  localIp?: string
+  error?: string
+}
+
+export type LegacyWifiForgetResultEvent = {
+  type: "wifi_forget_result"
+  mode: "legacy"
+  ssid: string
+  dispatched: boolean
+  connected?: boolean
+  currentSsid?: string
+  localIp?: string
+  error?: string
+}
+
+export type WifiForgetResultEvent = ModernWifiForgetResultEvent | LegacyWifiForgetResultEvent
+
+export type SavedWifiNetworksOutcome = "confirmed" | "unsupported" | "failed"
+
+export type SavedWifiNetworksResult = {
+  outcome: SavedWifiNetworksOutcome
+  networks: string[]
+  error?: string
+}
+
+export type SavedWifiNetworksEvent = {
+  type: "saved_wifi_networks"
+  requestId: string
+  sid: string
+  protocolVersion: number
+  outcome: SavedWifiNetworksOutcome
+  networks: string[]
+  error?: string
+}
+
+export type HotspotStatus =
+  | {state: "disabled"}
+  | {
+      state: "enabled"
+      ssid: string
+      password: string
+      localIp: string
+      /** The AP's channel in MHz, when the glasses know it: their station's, which the AP shares. */
+      frequency?: number
+    }
+
+export type EnabledHotspotStatus = Extract<HotspotStatus, {state: "enabled"}>
+
+export function isEnabledHotspotStatus(status: HotspotStatus): status is EnabledHotspotStatus {
+  return status.state === "enabled"
+}
+
+export type HotspotStatusChangeEvent = HotspotStatus & {
+  type: "hotspot_status_change"
+}
+
+export type HotspotErrorEvent = {
+  type: "hotspot_error"
+  errorMessage: string
+  timestamp: number
+}
+
+export type VersionInfoResult = {
+  versionInfoType?: string
+  sid?: string
+  androidVersion: string
+  firmwareVersion: string
+  besFirmwareVersion: string
+  mtkFirmwareVersion: string
+  buildNumber: string
+  systemTimeMs?: number
+  otaVersionUrl: string
+  appVersion: string
+  /**
+   * Package the glasses client actually runs as, from `version_info_1`.
+   * `"com.mentra.asg_client"` is the stock client; anything else is a sideloaded build (Android
+   * forces a distinct package on any build not signed with Mentra's release key) that coexists
+   * with the stock app and must not be driven by OTA.
+   *
+   * Omitted — not empty — whenever this result carries no identity: either the glasses predate
+   * the field, or the response resolved from a `version_info` chunk that does not carry it (only
+   * chunk 1 does). Omission is what keeps a response from overwriting an identity an earlier
+   * chunk established, so treat `undefined` as "unknown", never as "stock".
+   */
+  packageName?: string
+  /** Phone-served hotspot OTA protocol version; 0 means unsupported/legacy glasses. */
+  hotspotOtaVersion: number
+  /** Session-correlated WiFi forget result protocol; absent/0 means unsupported. */
+  wifiForgetResultVersion?: number
+  /** Session-correlated saved-network listing protocol; absent/0 means unsupported. */
+  savedWifiNetworksVersion?: number
+}
+
+export type VersionInfoEvent = VersionInfoResult & {
+  type: "version_info"
+}
+
+export type WifiScanResultEvent = {
+  type: "wifi_scan_result"
+  networks: WifiSearchResult[]
+  scanComplete?: boolean
+}
+
+export type PhotoResponseEvent =
+  | {
+      type: "photo_response"
+      state: "success"
+      requestId: string
+      /** Where the photo was uploaded; empty for a `localFile` request. */
+      uploadUrl: string
+      /** The upload target's own URL for the photo, or the saved file's `file://` URI for a `localFile` request. */
+      photoUrl?: string
+      statusUrl?: string
+      contentType?: string
+      fileSizeBytes?: number
+      timestamp: number
+    }
+  | {
+      type: "photo_response"
+      state: "error"
+      requestId: string
+      timestamp: number
+      errorCode?: string
+      errorMessage: string
+    }
+
+export type PhotoSuccessResponseEvent = Extract<PhotoResponseEvent, {state: "success"}>
+
+export type PhotoStatusState =
+  | "accepted"
+  | "queued"
+  | "configuring"
+  | "capturing"
+  | "captured"
+  | "compressing"
+  | "ble_fallback_compression"
+  | "uploading"
+  | "uploaded"
+  | "ready_for_transfer"
+  | "transferring"
+  | "thumbnail_received"
+  | "failed"
+
+export type PhotoResolvedConfig = {
+  format?: "jpeg" | string
+  width?: number
+  height?: number
+  quality?: number
+  requestedSize?: PhotoSize | string
+  source?: "sdk" | "button" | string
+  transferMethod?: "webhook" | "ble" | "local" | string
+  compression?: PhotoCompression
+  saveToGallery?: boolean
+  exposureTimeNs?: number
+  iso?: number
+}
+
+export type PhotoFpsRange = {
+  min?: number
+  max?: number
+}
+
+export type PhotoRequestedCaptureConfig = {
+  manual?: boolean
+  exposureTimeNs?: number
+  iso?: number
+  frameDurationNs?: number
+  aeMode?: number
+  aeLock?: boolean
+  aeExposureCompensation?: number
+  aeTargetFpsRange?: PhotoFpsRange
+  noiseReductionMode?: number
+  edgeMode?: number
+  afMode?: number
+  zsl?: boolean
+}
+
+export type PhotoMeteredPreview = {
+  exposureTimeNs?: number
+  iso?: number
+  totalLightProxy?: number
+}
+
+export type PhotoCaptureMetadata = {
+  manual?: boolean
+  exposureTimeNs?: number
+  iso?: number
+  frameDurationNs?: number
+  aeMode?: number
+  aeState?: number
+  aeStateName?: string
+  noiseReductionMode?: number
+  edgeMode?: number
+  zsl?: boolean
+  sensorTimestampNs?: number
+  totalLightProxy?: number
+  mfnrLikely?: boolean
+  mfnrApplied?: boolean
+  width?: number
+  height?: number
+  noiseReductionWarning?: "not_implemented" | string
+  ispDigitalGainWarning?: "not_implemented" | string
+  ispAnalogGainWarning?: "not_implemented" | string
+  [key: string]: unknown
+}
+
+export type PhotoStatusEvent = {
+  type: "photo_status"
+  requestId: string
+  status: PhotoStatusState | string
+  timestamp: number
+  resolvedConfig?: PhotoResolvedConfig
+  requestedCaptureConfig?: PhotoRequestedCaptureConfig
+  meteredPreview?: PhotoMeteredPreview
+  captureMetadata?: PhotoCaptureMetadata
+  errorCode?: string
+  errorMessage?: string
+  /** Present on thumbnail_received: a JPEG data URI, not the final photo. */
+  thumbnailUrl?: string
+  fileSizeBytes?: number
+}
+
+export type CameraStatusEvent = {
+  type: "camera_status"
+  requestId: string
+  state: "warming" | "ready" | "stopped" | "error" | string
+  timestamp: number
+  errorCode?: string
+  errorMessage?: string
+}
+
+export type VideoRecordingStatusEvent = {
+  type: "video_recording_status"
+  requestId?: string
+  success: boolean
+  status: VideoRecordingStatusState
+  details?: string | null
+  timestamp: number
+  data?: {
+    recording?: boolean
+    duration_ms?: number
+    duration_formatted?: string
+    [key: string]: unknown
+  }
+}
+
+export type VideoRecordingStatusState =
+  | "recording_started"
+  | "recording_status"
+  | "already_recording"
+  | "recording_stopped"
+  | "not_recording"
+  | "request_id_mismatch"
+  | "service_unavailable"
+  | "json_error"
+  | "battery_low"
+  | "camera_busy"
+  | "storage_unavailable"
+  | "integrity_failed"
+  | "error"
+
+export type VideoRecordingStartedStatusEvent = Omit<VideoRecordingStatusEvent, "success" | "status"> & {
+  success: true
+  status: "recording_started"
+}
+
+export type VideoRecordingStoppedStatusEvent = Omit<VideoRecordingStatusEvent, "success" | "status"> & {
+  success: true
+  status: "recording_stopped"
+}
+
+export type VideoRecordingSuccessStatusEvent = VideoRecordingStartedStatusEvent | VideoRecordingStoppedStatusEvent
+
+export type MediaUploadSuccessEvent = {
+  type: "media_success"
+  requestId: string
+  mediaUrl: string
+  mediaType: number
+  timestamp: number
+}
+
+export type MediaUploadErrorEvent = {
+  type: "media_error"
+  requestId: string
+  errorMessage: string
+  mediaType: number
+  timestamp: number
+}
+
+export type MediaUploadEvent = MediaUploadSuccessEvent | MediaUploadErrorEvent
+
+export type GalleryStatusEvent = {
+  type: "gallery_status"
+  photos: number
+  videos: number
+  total: number
+  totalSize?: number
+  hasContent: boolean
+  cameraBusy: boolean
+  cameraBusyReason?: "video" | "stream" | (string & {})
+}
+
+export type CompatibleGlassesSearchStopEvent = {
+  type: "compatible_glasses_search_stop"
+  deviceModel: DeviceModel
+}
+
+export type HeartbeatSentEvent = {
+  type: "heartbeat_sent"
+  heartbeat_sent: {
+    timestamp: number
+  }
+}
+
+export type HeartbeatReceivedEvent = {
+  type: "heartbeat_received"
+  heartbeat_received: {
+    timestamp: number
+  }
+}
+
+export type SwipeVolumeStatusEvent = {
+  type: "swipe_volume_status"
+  enabled: boolean
+  timestamp: number
+}
+
+export type SwitchStatusEvent = {
+  type: "switch_status"
+  switchType?: number
+  switchValue?: number
+  timestamp: number
+}
+
+/**
+ * Mentra Live center-mic gate + ADC gain overrides. Internal SDK surface: this
+ * is a super-mode tuning aid, not a public capability.
+ *
+ * Every field is optional; an omitted field keeps the firmware default. The
+ * glasses hold these in RAM only and drop them on disconnect, so the phone
+ * re-sends on every connect.
+ */
+export type MicTuning = {
+  /** codec_adc_vol index, 0-15. 15 is +32 dB, the top of the table. */
+  gain?: number
+  /** Gate open / close thresholds, linear RMS on int16 samples. */
+  open?: number
+  close?: number
+  /** Frames of 10 ms. */
+  attack?: number
+  hang?: number
+  /** Thresholds used while the speaker is active or within its hold-off. */
+  sp_open?: number
+  sp_close?: number
+  sp_hold?: number
+}
+
+/**
+ * What the glasses report as actually in force, after their own clamping. Use
+ * this rather than the requested value when showing applied settings.
+ */
+export type MicTuningStateEvent = MicTuning & {
+  type: "mic_tuning_state"
+  /** Tuning revision; increments on every accepted set or reset. */
+  generation: number
+  /** True when any override is in force. */
+  overridden: boolean
+}
+
+/** Live center-mic level. Disposable: samples are dropped under any pressure. */
+export type MicRmsEvent = {
+  type: "mic_rms"
+  rms: number
+  gateOpen: boolean
+  speakerElevated: boolean
+  /** Tuning revision the sample was measured under. */
+  generation: number
+}
+
+/**
+ * Mentra Live wear-detection vote. Internal SDK surface: Super Mode only.
+ * Values live in RAM on the glasses and reset on disconnect.
+ */
+export type WearTuning = {
+  /** Poll period in milliseconds. Firmware clamp: 50–2000. */
+  interval?: number
+  /** Sliding-window length. Firmware clamp: 3–15. */
+  count?: number
+  /** Votes needed to flip, either direction. Must be > count/2 and ≤ count. */
+  majority?: number
+}
+
+/** Current wear vote from sr_wrst, or an unsolicited wear transition. */
+export type WearStateEvent = {
+  type: "wear_state"
+  worn: boolean
+  /** Unworn countdown, present on firmware that reports it. Milliseconds. */
+  elapsedMs?: number
+  timeoutMs?: number
+  /** cs_swit type 11. Absent on older firmware. */
+  enabled?: boolean
+  /** Countdown is running (glasses are off the face and the feature is on). */
+  armed?: boolean
+  /** Clock is running, but charging, a call, OTA, or factory test is holding shutdown. */
+  inhibited?: boolean
+}
+
+/**
+ * What the wear poll loop is actually running. A rejected patch echoes the
+ * unchanged values with `accepted: false`.
+ */
+export type WearTuningEvent = WearTuning & {
+  type: "wear_tuning"
+  enabled: boolean
+  interval: number
+  count: number
+  majority: number
+  generation: number
+  accepted: boolean
+}
+
+export type RgbLedControlResponseEvent =
+  | {
+      type: "rgb_led_control_response"
+      state: "success"
+      requestId: string
+    }
+  | {
+      type: "rgb_led_control_response"
+      state: "error"
+      requestId: string
+      errorCode: string
+    }
+
+export type RgbLedControlSuccessResponseEvent = Extract<RgbLedControlResponseEvent, {state: "success"}>
+
+export type TouchGesture =
+  | "single_tap"
+  | "double_tap"
+  | "triple_tap"
+  | "long_press"
+  | "forward_swipe"
+  | "backward_swipe"
+  | "up_swipe"
+  | "down_swipe"
+
+export type SettingsAckStatus = "applied" | "ready" | "error" | "failed" | "failure" | "rejected"
+
+export type SettingsAckSetting =
+  | "touch_gesture_default"
+  | "gallery_server"
+  | "gallery_mode"
+  | "button_photo"
+  | "button_video_recording"
+  | "button_max_recording_time"
+  | "camera_fov"
+  | "camera_fov_override"
+  | "camera_tuning"
+
+export type SettingsAckEvent = {
+  type: "settings_ack"
+  requestId: string
+  setting: SettingsAckSetting
+  /** Gesture whose stock behavior was changed; present for touch_gesture_default. */
+  gesture?: TouchGesture
+  status: SettingsAckStatus
+  timestamp: number
+  fov?: number
+  roiPosition?: CameraRoiPositionValue
+  hardwareApplied?: boolean
+  leaseId?: string
+  active?: boolean
+  size?: ButtonPhotoSize | string
+  width?: number
+  height?: number
+  fps?: number
+  enabled?: boolean
+  minutes?: number
+  /** Current site-network listener state; present for gallery_server acknowledgements. */
+  listening?: boolean
+  /** Current HTTP base URL; present for gallery_server only while listening. */
+  url?: string
+  /** ANR enabled flag; present when setting === "camera_tuning" */
+  anr?: boolean
+  /** Stock-gain flag; present when setting === "camera_tuning" */
+  gain?: boolean
+  errorCode?: string
+  errorMessage?: string
+}
+
+export type SettingsAckSuccessStatus = Exclude<SettingsAckStatus, "error" | "failed" | "failure" | "rejected">
+
+export type SettingsAckSuccessEvent = Omit<SettingsAckEvent, "status"> & {
+  status: SettingsAckSuccessStatus
+}
+
+export type RgbLedAction = "on" | "off"
+export type RgbLedColor = "red" | "green" | "blue" | "orange" | "white"
+export type PhotoSize = "low" | "medium" | "high" | "max"
+export type PhotoMode = "photo" | "text"
+export type PhotoTransferMethod = "auto" | "direct" | "ble"
+export type ButtonPhotoSize = "low" | "medium" | "high" | "max"
+
+/**
+ * @deprecated Sticky action-button photo presets via {@link BluetoothSdkPublicModule.setPhotoCaptureDefaults}
+ * are deprecated. Prefer per-request {@link BluetoothSdkPublicModule.requestPhoto} options
+ * (e.g. `mode: "text"` for text sensor size/crop, or explicit `aeExposureDivisor`) instead of
+ * persisting button-photo tuning on the glasses.
+ */
+export type PhotoCaptureDefaults = {
+  size?: PhotoSize
+  /** ZSL preview buffering for physical camera-button photos. */
+  zsl?: boolean
+  /** MFNR still capture for physical camera-button photos. */
+  mfnr?: boolean
+  noiseReduction?: boolean
+  edgeEnhancement?: boolean
+  ispDigitalGain?: number
+  ispAnalogGain?: string
+  aeExposureDivisor?: number
+  isoCap?: number
+  compress?: PhotoCompression
+  sound?: boolean
+  /** When true, clears stored NR/edge/ISP presets on the glasses before applying other fields. */
+  resetCaptureTuning?: boolean
+}
+
+export type VideoRecordingDefaults = {
+  width: number
+  height: number
+  fps: number
+}
+
+/**
+ * Optional per-recording video settings for {@link startVideoRecording}. When
+ * omitted, the glasses fall back to their saved video recording defaults. Any
+ * field left undefined is omitted from the BLE command (glasses default applies).
+ */
+export interface VideoRecordingSettings {
+  width?: number
+  height?: number
+  fps?: number
+  /**
+   * Optional auto-stop timer in minutes, sent on `start_video_recording`.
+   * `0` (the default) means record until stopped or interrupted
+   * (battery/storage/thermal/error).
+   */
+  maxRecordingTimeMinutes?: number
+}
+export const DeviceModels = {
+  Simulated: "Simulated Glasses",
+  G1: "Even Realities G1",
+  G2: "Even Realities G2",
+  MentraLive: "Mentra Live",
+  MentraNex: "Mentra Display",
+  Mach1: "Mentra Mach1",
+  Z100: "Vuzix Z100",
+  Frame: "Brilliant Frame",
+  Nimo: "NIMO",
+  Ar99: "AR99",
+  R1: "Even Realities R1",
+} as const
+
+export type DeviceModel = (typeof DeviceModels)[keyof typeof DeviceModels]
+export type ObservableStoreCategory = "glasses" | "bluetooth" | "core"
+
+export type DashboardMenuItem = {
+  title: string
+  packageName: string
+  values?: Record<string, unknown>
+}
+
+export const CAMERA_FOV_MIN = 62
+export const CAMERA_FOV_MAX = 118
+export const CAMERA_FOV_DEFAULT = CAMERA_FOV_MAX
+
+export type CameraRoiPosition = "center" | "bottom" | "top"
+export type CameraRoiPositionValue = 0 | 1 | 2
+export type CameraFovPreset = "narrow" | "standard" | "wide"
+
+export type CameraFovRequest =
+  | {
+      fov: number
+      roiPosition?: CameraRoiPosition
+    }
+  | {
+      preset: CameraFovPreset
+    }
+
+export type CameraFovResult = {
+  requestId: string
+  fov: number
+  roiPosition: CameraRoiPosition
+  timestamp: number
+}
+
+export type CameraFovOverrideRequest = CameraFovRequest & {
+  /** Phone-owned lease used to make delayed releases safe. */
+  leaseId: string
+  /** Safety TTL; refresh the same lease/configuration to extend without a HAL restart. */
+  ttlMs?: number
+}
+
+export type CameraFovSetting = {
+  fov: number
+  roiPosition: CameraRoiPositionValue
+}
+
+type NativeCameraFovSetting = {
+  fov: number
+  roi_position: CameraRoiPositionValue
+}
+
+export type MicPreference = "auto" | "phone" | "glasses" | "bluetooth"
+export type MicMode = "phone" | "glasses" | "bluetoothClassic" | "bluetooth"
+
+export type PhotoRequestParams = {
+  /**
+   * Send an oriented <=500px, quality-50 JPEG preview before the full photo. Default false.
+   * Enables a 110-second end-to-end native deadline (ordinary requests: 30 seconds).
+   */
+  presend_thumbnail?: boolean
+  requestId?: string
+  appId?: string
+  size: PhotoSize
+  mode?: PhotoMode
+  /** `direct` disables BLE fallback; `ble` skips direct upload and forces phone-relayed transfer. */
+  transferMethod?: PhotoTransferMethod
+  webhookUrl: string | null
+  authToken: string | null
+  /**
+   * Keep the photo on the phone: it comes over BLE, is saved as a JPEG file, and the success
+   * response carries that file's `file://` URI as `photoUrl`, with `fileSizeBytes`. Nothing is
+   * uploaded, and `webhookUrl`, `authToken` and `transferMethod` are ignored. The file is in the
+   * app's cache folder and is the caller's to move or delete. Default false.
+   */
+  localFile?: boolean
+  compress?: PhotoCompression
+  save?: boolean
+  sound: boolean
+  exposureTimeNs?: number | null
+  /** Sensor ISO for this capture only. Only used when exposureTimeNs enables manual exposure. */
+  iso?: number | null
+  /** After AE convergence, divide metered exposure by this factor (scan mode). */
+  aeExposureDivisor?: number
+  /** Cap ISO after AE metering (scan mode). */
+  isoCap?: number
+  /** Requested on wire; glasses may log not_implemented. */
+  noiseReduction?: boolean
+  edgeEnhancement?: boolean
+  /** ZSL buffering. Forced off for manual/scan stills because fixed sensor controls take priority. */
+  zsl?: boolean
+  /** MFNR still capture. Forced off for manual/scan stills because fixed sensor controls take priority. */
+  mfnr?: boolean
+  ispDigitalGain?: number
+  ispAnalogGain?: string
+}
+
+export type WarmUpCameraParams = {
+  /** Supply this when the owner needs to call stopCameraWarmUp during teardown. */
+  requestId?: string
+  size: PhotoSize
+  mode?: PhotoMode
+  exposureTimeNs?: number | null
+  /** Ready-state hold; defaults to 15 seconds and is capped at 5 minutes by ASG. */
+  durationMs?: number
+  /** ZSL preview buffering for the warm-up session. */
+  zsl?: boolean
+  /** MFNR still capture for the warm-up session. */
+  mfnr?: boolean
+}
+
+export type StreamDegradationPreference = "MAINTAIN_FRAMERATE" | "MAINTAIN_RESOLUTION" | "BALANCED" | "DISABLED"
+
+export type StreamVideoConfig = {
+  width?: number
+  height?: number
+  bitrate?: number
+  /** WHIP minimum target in bps; omitted leaves it unset. Clamped to the maximum. */
+  minBitrateBps?: number
+  /** WHIP startup bitrate in bps, clamped to the requested bounds. */
+  initialBitrateBps?: number
+  fps?: number
+  /** WHIP adaptation policy. Omit to keep the glasses' MAINTAIN_FRAMERATE default. */
+  degradationPreference?: StreamDegradationPreference
+}
+
+export type StreamAudioConfig = {
+  bitrate?: number
+  sampleRate?: number
+  echoCancellation?: boolean
+  noiseSuppression?: boolean
+}
+
+/** ICE overrides for a WHIP stream. Ignored by the RTMP and SRT paths. */
+export type StreamIceConfig = {
+  /**
+   * STUN server the glasses should use while gathering candidates.
+   *
+   * Omit to send the default Cloudflare STUN server. Pass an empty string to force host-only
+   * gathering, which is what SoftAP calling needs: the WHIP server runs on the phone across the
+   * glasses' own hotspot, so a server-reflexive candidate is meaningless and there is no route to
+   * a STUN server anyway. The glasses treat a value that is not a `stun:`/`stuns:` URI as host-only.
+   */
+  stun?: string
+}
+
+export type StreamStartRequest = {
+  type?: "start_stream"
+  streamUrl: string
+  streamId?: string
+  sound?: boolean
+  video?: StreamVideoConfig
+  audio?: StreamAudioConfig
+  ice?: StreamIceConfig
+  /** When false, glasses skip mic capture. Defaults to true. */
+  captureAudio?: boolean
+  /**
+   * Correlation id echoed by the glasses in every SOFTAP_TRACE log line, so phone and glasses
+   * logs can be joined despite having unsynchronised clocks.
+   *
+   * TEMPORARY: part of the SoftAP diagnostic trace layer.
+   */
+  traceId?: string
+  authToken?: string
+  telemetry?: boolean
+}
+
+export type StreamKeepAliveRequest = {
+  type?: "keep_stream_alive"
+  streamId: string
+  ackId: string
+}
+
+/**
+ * Stable machine-readable `pair_failure` causes. Unknown native codes still typecheck.
+ * `ios_forget_pairing`: iOS holds a stale Bluetooth pairing for these glasses during an
+ * explicit attempt; the user must remove it in Settings > Bluetooth before pairing again.
+ */
+export type PairFailureCode = "ios_forget_pairing" | string
+
+export type PairFailureEvent = {
+  type: "pair_failure"
+  error: string
+  /** Stable cause, when the SDK can classify the failure. */
+  code?: PairFailureCode
+}
+
+/**
+ * Mentra Live pairing state, owned by the SDK.
+ * - `normal`: no pairing mode in effect; automatic reconnect is allowed.
+ * - `pairing_mode`: the glasses opened a pairing window. Automatic reconnect is paused until
+ *   `endsAtMs` or until the glasses report the window ended. `windowId` identifies the
+ *   window and survives a cold restart.
+ * - `pairing_rejected`: the glasses no longer accept this phone (another phone paired, or repeated
+ *   authentication rejections on secure-pairing firmware). Reconnect has stopped. Render Pair Again.
+ */
+export type MentraLivePairingState =
+  | {state: "normal"}
+  | {state: "pairing_mode"; windowId: number; endsAtMs: number}
+  | {state: "pairing_rejected"}
+
+export type PairingStateChangedEvent = {
+  state: MentraLivePairingState
+}
+
+/**
+ * Whether the user has to do anything to get glasses audio working, decided by the SDK for
+ * every glasses model. Render it; do not add your own audio timers or platform checks.
+ *
+ * - `idle`: no glasses session.
+ * - `not_applicable`: no user step for audio. Android attaches Classic audio from the BLE bond,
+ *   and glasses without Classic audio have nothing to set up.
+ * - `connecting`: the glasses are connected, audio is not, and the SDK still expects audio to
+ *   come up on its own (for example iPhone audio derived from the BLE pair). After setup, Mentra
+ *   Live firmware that reports `classic_link` reconnects audio itself and stays here.
+ * - `connected`: Classic audio (A2DP or HFP) to the glasses is up.
+ * - `needs_user`: audio did not come up on its own. Ask the user to connect the glasses in the
+ *   system Bluetooth settings (iPhone: Settings > Bluetooth). The state moves to `connected`
+ *   as soon as audio comes up.
+ */
+export type GlassesAudioSetupState =
+  | {state: "idle"}
+  | {state: "not_applicable"}
+  | {state: "connecting"}
+  | {state: "connected"}
+  | {state: "needs_user"; action: "connect_in_settings"}
+
+export type AudioSetupChangedEvent = {
+  state: GlassesAudioSetupState
+}
+
+export type PairingModeEndedReason = "paired" | "cancelled" | "timeout" | string
+
+export type PairingModeEndedEvent = {
+  reason: PairingModeEndedReason
+  window_id?: number
+}
+
+export type PairingInfoEvent = {
+  had_previous_bond: boolean
+  pairing_code?: string
+  classic_bond_ready?: boolean
+  secure_pairing_capable?: boolean
+  protocol_version?: number
+  /** Present when the glasses build includes ownership transfer. */
+  ownership_transfer?: boolean
+  /** True when the glasses derive Classic audio from the LE pair (CTKD), so audio should connect on its own. */
+  auto_audio?: boolean
+  /** True only after a BLE bond committed the owner and the window closed. */
+  owner_committed?: boolean
+}
+
+export type EnteringPairingModeEvent = {
+  window_ms: number
+  /** Identifies this pairing window. Also carried in `pairing_mode_ended` and the advertisement. */
+  window_id?: number
+  reason?: string
+  /** The glasses kept their bonds when the window opened; they change only if another phone pairs. */
+  owner_retained?: boolean
+}
+
+/**
+ * @deprecated No longer emitted. Observe `pairing_state_changed` (or `GlassesStatus.pairingState`)
+ * and render Pair Again for `pairing_rejected`.
+ */
+export type OwnerReplacedEvent = {
+  reason: string
+}
+
+export type AudioPairingNeededEvent = {
+  type: "audio_pairing_needed"
+  deviceName: string
+}
+
+export type AudioConnectedEvent = {
+  type: "audio_connected"
+  deviceName: string
+}
+
+export type AudioDisconnectedEvent = {
+  type: "audio_disconnected"
+}
+
+export type SaveSettingEvent = {
+  type: "save_setting"
+  key: string
+  value: any
+}
+
+export type WsTextEvent = {
+  type: "ws_text"
+  text: string
+}
+
+export type WsBinEvent = {
+  type: "ws_bin"
+  base64: string
+}
+
+export type MicPcmEvent = {
+  type: "mic_pcm"
+  pcm: ArrayBuffer
+  sampleRate: 16000
+  bitsPerSample: 16
+  channels: 1
+  encoding: "pcm_s16le"
+  voiceActivityDetectionEnabled: boolean
+  /**
+   * The microphone this buffer came from (`"glasses"`, `"phone"`, `"bluetooth"`, or `""` when none
+   * is selected). Stamped per frame because the SDK can move the source mid-stream, so a consumer
+   * that told a remote party which microphone it is sending can check rather than assume.
+   */
+  source: string
+}
+
+export type MicLc3Event = {
+  type: "mic_lc3"
+  lc3: ArrayBuffer
+  sampleRate: 16000
+  channels: 1
+  encoding: "lc3"
+  frameDurationMs: 10
+  frameSizeBytes: number
+  bitrate: number
+  packetizedFromGlasses: boolean
+  voiceActivityDetectionEnabled: boolean
+}
+
+/** Native glasses-microphone diagnostics emitted when the SDK detects a transport or decode issue. */
+export type MicHealthEvent = {
+  type: "mic_health"
+  reason: "sequence_gap" | "decode_failure"
+  sequenceGapEvents: number
+  decodeFailures: number
+  lastLc3ReceivedAt?: number
+  lastPcmProducedAt?: number
+  timestamp: number
+}
+
+export type StreamStatusLifecycleState = "initializing" | "streaming" | "stopping" | "stopped"
+export type StreamStatusReconnectState = "reconnecting" | "reconnected" | "reconnect_failed"
+export type StreamStatusState = StreamStatusLifecycleState | StreamStatusReconnectState | "error"
+
+/** Effective stream settings reported by the glasses after defaults and clamps. */
+export type StreamResolvedConfig = {
+  transport?: "rtmp" | "srt" | "whip"
+  video?: {
+    /** Encoded output width sent to the stream endpoint. */
+    width: number
+    /** Encoded output height sent to the stream endpoint. */
+    height: number
+    /** Native camera buffer width selected before crop/downscale. */
+    captureWidth?: number
+    /** Native camera buffer height selected before crop/downscale. */
+    captureHeight?: number
+    /** Encoded video bitrate in bits per second. */
+    bitrate: number
+    /** Resolved capture/encode frame rate. */
+    fps: number
+    /** Applied WHIP adaptation policy; absent on older firmware and other transports. */
+    degradationPreference?: StreamDegradationPreference
+  }
+  audio?: {
+    /** Encoded audio bitrate in bits per second. */
+    bitrate?: number
+    /** Audio sample rate in Hz. */
+    sampleRate?: number
+    echoCancellation?: boolean
+    noiseSuppression?: boolean
+  }
+}
+
+/** Live encoder and device telemetry emitted periodically by supported glasses firmware. */
+export type StreamLiveStats = {
+  /** Current encoded video bitrate in bits per second. */
+  bitrate?: number
+  /** Current encode frame rate. */
+  fps?: number
+  droppedFrames?: number
+  /** Seconds since the stream started. */
+  duration?: number
+  /** Device temperature in 闂佺娅ｉ悡? if the hardware reports it. */
+  temperatureC?: number
+}
+
+type StreamStatusCommon = {
+  type: "stream_status"
+  streamId?: string
+  /** ASG process identity and monotonic revision for reconnect reconciliation. */
+  sid?: string
+  revision?: number
+  terminal?: boolean
+  errorDetails?: string
+  timestamp?: number
+  resolvedConfig?: StreamResolvedConfig
+  stats?: StreamLiveStats
+}
+
+export type StreamStatusEvent =
+  | (StreamStatusCommon & {
+      kind: "lifecycle"
+      status: StreamStatusLifecycleState
+    })
+  | (StreamStatusCommon & {
+      kind: "reconnect"
+      status: "reconnecting"
+      attempt: number
+      maxAttempts: number
+      reason: string
+    })
+  | (StreamStatusCommon & {
+      kind: "reconnect"
+      status: "reconnected"
+      attempt: number
+    })
+  | (StreamStatusCommon & {
+      kind: "reconnect"
+      status: "reconnect_failed"
+      maxAttempts: number
+    })
+  | (StreamStatusCommon & {
+      kind: "error"
+      status: "error"
+      errorDetails: string
+    })
+  | (StreamStatusCommon & {
+      kind: "snapshot"
+      status: StreamStatusState
+      streaming: boolean
+      reconnecting: boolean
+      attempt?: number
+    })
+
+export type KeepAliveAckEvent = {
+  type: "keep_alive_ack"
+  streamId: string
+  ackId: string
+  timestamp?: number
+}
+
+export type MtkUpdateCompleteEvent = {
+  type: "mtk_update_complete"
+  message: string
+  timestamp: number
+}
+
+/**
+ * The glasses process restarted while the BES kept the BLE link alive (its `sid`
+ * changed, or first appeared after an update from a pre-sid build). There is no
+ * physical disconnect for this — treat it as the logical reconnect edge.
+ */
+export type GlassesSessionChangedEvent = {
+  type: "glasses_session_changed"
+  previous_sid: string
+  sid: string
+}
+
+/** @deprecated Glasses no longer emit ota_progress; use {@link OtaStatusEvent} and status-store mapping. */
+export type OtaProgressEvent = {
+  type: "ota_progress"
+  stage?: OtaStage
+  status?: OtaProgressStatus
+  progress?: number
+  bytes_downloaded?: number
+  total_bytes?: number
+  current_update?: string
+  error_message?: string
+}
+
+export type OtaStartAckEvent = {
+  type: "ota_start_ack"
+  timestamp: number
+}
+export type OtaStatusEvent = {
+  type: "ota_status"
+  session_id: string
+  total_steps: number
+  current_step: number
+  step_type: "apk" | "mtk" | "bes"
+  phase: "download" | "install"
+  step_percent: number
+  /** Real bytes received in the current download; absent on older glasses. */
+  bytes_downloaded?: number
+  overall_percent: number
+  status: "in_progress" | "step_complete" | "complete" | "failed" | "idle"
+  error_message?: string
+}
+
+export type OtaQueryResult = OtaStatusEvent
+
+/** Lifecycle of a BES crash incident bundle on Mentra Live glasses. */
+export type BesCrashIncidentState = "COLLECTING" | "STORED" | "REPORTED" | "UPLOADED" | "EVICTED"
+
+/** One incident bundle the glasses dropped to stay within their storage budget. */
+export type BesCrashEviction = {
+  incidentKey: string
+  reason: string
+  bytes: number
+  ms: number
+}
+
+/**
+ * Glasses-side summary of a BES crash incident. Fields the glasses could not
+ * determine (for example `dumpId` of a reset without a dump) may be absent or null.
+ */
+export type BesCrashSummary = {
+  attribution: "match" | "older" | "unknown"
+  dumpId?: string | null
+  bootId?: string | null
+  resetHw?: number | null
+  resetSw?: number | null
+  crashUnixMs?: number | null
+  coveredFromMs?: number | null
+  coveredToMs?: number | null
+  traceGaps: number
+  truncated: boolean
+  torn: boolean
+  tailCaptured: boolean
+  dumpGap: boolean
+  evictedCount: number
+  recentEvictions: BesCrashEviction[]
+}
+
+/**
+ * Mentra Live stored a BES crash or unexpected-reset incident. Sent when the
+ * incident becomes `STORED`, and again on every reconnect while it is `STORED`
+ * or `REPORTED`, so handlers must be idempotent per `incidentKey`.
+ */
+export type BesCrashDetectedEvent = {
+  type: "bes_crash_detected"
+  incidentKey: string
+  reason: "bes_crash" | "bes_unexpected_reset"
+  state: BesCrashIncidentState
+  /** Cloud report already recorded for this incident, or null before one is reported. */
+  reportId: string | null
+  summary: BesCrashSummary
+}
+
+/** Nex BLE protobuf trace (NexEventUtils); payload matches native Map keys. */
+export type BleCommandTraceEvent = {
+  command: string
+  commandText: string
+  timestamp: number
+}
+
+export type MiniappSelectedEvent = {
+  type: "miniapp_selected"
+  packageName: string
+}
+
+// Union type of all native/internal Bluetooth SDK events.
+export type BluetoothSdkInternalEvent = Parameters<BluetoothSdkModuleEvents[keyof BluetoothSdkModuleEvents]>[0]
+
+export type BluetoothSdkModuleEvents = {
+  glasses_status: (changed: Partial<GlassesStatus>) => void
+  bluetooth_status: (changed: Partial<BluetoothStatus>) => void
+  log: (event: LogEvent) => void
+  sdk_update_notice: (event: {message: string}) => void
+  device_discovered: (device: Device) => void
+  default_device_changed: (event: {device?: Device}) => void
+  // Individual event handlers
+  glasses_not_ready: (event: GlassesNotReadyEvent) => void
+  button_press: (event: ButtonPressEvent) => void
+  touch_event: (event: TouchEvent) => void
+  accel_event: (event: AccelEvent) => void
+  head_up: (event: HeadUpEvent) => void
+  voice_activity_detection_status: (event: VoiceActivityDetectionStatusEvent) => void
+  speaking_status: (event: SpeakingStatusEvent) => void
+  battery_status: (event: BatteryStatusEvent) => void
+  wake_word: (event: WakeWordEvent) => void
+  speech_activity: (event: SpeechActivityEvent) => void
+  local_transcription: (event: LocalTranscriptionEvent) => void
+  native_notification_status: (event: NativeNotificationStatus) => void
+  native_notification_delivery: (event: NativeNotificationDelivery) => void
+  phone_notification: (event: PhoneNotificationEvent) => void
+  phone_notification_dismissed: (event: PhoneNotificationDismissedEvent) => void
+  wifi_status_change: (event: WifiStatusChangeEvent) => void
+  wifi_scan_result: (event: WifiScanResultEvent) => void
+  wifi_forget_result: (event: WifiForgetResultEvent) => void
+  saved_wifi_networks: (event: SavedWifiNetworksEvent) => void
+  hotspot_status_change: (event: HotspotStatusChangeEvent) => void
+  hotspot_error: (event: HotspotErrorEvent) => void
+  photo_response: (event: PhotoResponseEvent) => void
+  photo_status: (event: PhotoStatusEvent) => void
+  camera_status: (event: CameraStatusEvent) => void
+  video_recording_status: (event: VideoRecordingStatusEvent) => void
+  media_success: (event: MediaUploadSuccessEvent) => void
+  media_error: (event: MediaUploadErrorEvent) => void
+  gallery_status: (event: GalleryStatusEvent) => void
+  compatible_glasses_search_stop: (event: CompatibleGlassesSearchStopEvent) => void
+  heartbeat_sent: (event: HeartbeatSentEvent) => void
+  heartbeat_received: (event: HeartbeatReceivedEvent) => void
+  swipe_volume_status: (event: SwipeVolumeStatusEvent) => void
+  switch_status: (event: SwitchStatusEvent) => void
+  mic_tuning_state: (event: MicTuningStateEvent) => void
+  mic_rms: (event: MicRmsEvent) => void
+  wear_state: (event: WearStateEvent) => void
+  wear_tuning: (event: WearTuningEvent) => void
+  rgb_led_control_response: (event: RgbLedControlResponseEvent) => void
+  settings_ack: (event: SettingsAckEvent) => void
+  pair_failure: (event: PairFailureEvent) => void
+  pairing_info: (event: PairingInfoEvent) => void
+  entering_pairing_mode: (event: EnteringPairingModeEvent) => void
+  pairing_mode_ended: (event: PairingModeEndedEvent) => void
+  pairing_state_changed: (event: PairingStateChangedEvent) => void
+  audio_setup_changed: (event: AudioSetupChangedEvent) => void
+  /** @deprecated No longer emitted. Use `pairing_state_changed`. */
+  owner_replaced: (event: OwnerReplacedEvent) => void
+  audio_pairing_needed: (event: AudioPairingNeededEvent) => void
+  audio_connected: (event: AudioConnectedEvent) => void
+  audio_disconnected: (event: AudioDisconnectedEvent) => void
+  save_setting: (event: SaveSettingEvent) => void
+  ws_text: (event: WsTextEvent) => void
+  ws_bin: (event: WsBinEvent) => void
+  mic_pcm: (event: MicPcmEvent) => void
+  mic_lc3: (event: MicLc3Event) => void
+  mic_health: (event: MicHealthEvent) => void
+  stream_status: (event: StreamStatusEvent) => void
+  keep_alive_ack: (event: KeepAliveAckEvent) => void
+  mtk_update_complete: (event: MtkUpdateCompleteEvent) => void
+  glasses_session_changed: (event: GlassesSessionChangedEvent) => void
+  ota_start_ack: (event: OtaStartAckEvent) => void
+  ota_status: (event: OtaStatusEvent) => void
+  ar99_ota_status: (event: Ar99OtaStatusEvent) => void
+  bes_crash_detected: (event: BesCrashDetectedEvent) => void
+  version_info: (event: VersionInfoEvent) => void
+  send_command_to_ble: (event: BleCommandTraceEvent) => void
+  receive_command_from_ble: (event: BleCommandTraceEvent) => void
+  miniapp_selected: (event: MiniappSelectedEvent) => void
+  extraction_progress: (event: ExtractionProgressEvent) => void
+}
+
+export interface ExtractionProgressEvent {
+  percentage: number
+  bytesRead: number
+  totalBytes: number
+}
+
+export interface Ar99OtaStatusEvent {
+  type: "ar99_ota_status"
+  phase: string
+  progress: number
+  offset: number
+  total: number
+  errorMessage?: string
+  error_message?: string
+}
+
+export interface PhoneNotificationEvent {
+  notificationId: string
+  app: string
+  title: string
+  content: string
+  priority: string
+  timestamp: number
+  packageName: string
+}
+
+export interface PhoneNotificationDismissedEvent {
+  notificationId: string
+  notificationKey: string
+  packageName: string
+  timestamp: number
+}
+
+/**
+ * Outbound payload for `sendPhoneNotification` — a notification pushed INTO the glasses' own
+ * notification centre. The inverse of {@link PhoneNotificationEvent}, which reports
+ * notifications the glasses relayed TO the phone (iOS/ANCS). Drivers map these keys onto
+ * whatever their firmware expects.
+ */
+export interface NativeNotificationConfig {
+  enabled: boolean
+  autoDisplay: boolean
+  durationSeconds: number
+  doNotDisturb: boolean
+  /** Android package names. iOS rejects nonempty lists; its ANCS filter is firmware-owned. */
+  blockedApps: string[]
+}
+
+export interface NativeNotificationStatus {
+  supported: boolean
+  source: "phone" | "ancs" | "unsupported"
+  authorization: "system" | "authorized" | "not_authorized" | "unknown"
+  /** `submitted` is not a firmware-confirmed acknowledgement. */
+  state: "unavailable" | "disabled" | "configuring" | "submitted" | "needs_reconnect" | "failed"
+  config: NativeNotificationConfig
+  error: string
+}
+
+export interface NativeNotificationDelivery {
+  notificationId: string
+  status: "delivered" | "failed" | "cancelled" | "dropped"
+  reason: string
+}
+
+export interface NativePhoneNotification {
+  /** Stable id from the phone's notification listener; parsed to an int where firmware needs one. */
+  notificationId: string
+  /** Reverse-DNS package id of the originating app. */
+  packageName: string
+  /** Human app name (e.g. "Messages"). */
+  appName: string
+  title: string
+  /** Android `android.subText`. Empty when the listener didn't capture one. */
+  subtitle: string
+  body: string
+  /** Unix ms post time. */
+  timestampMs: number
+  /** Posted or updated. Removal is not supported by the verified protocol. */
+  action: 0
+}
+
+export type PublicGlassesStatus = Omit<
+  GlassesStatus,
+  "otaUpdateAvailable" | "otaProgress" | "otaInProgress" | "otaVersionUrl"
+>
+
+export type PublicBluetoothStatus = Pick<
+  BluetoothStatus,
+  | "searching"
+  | "searchingController"
+  | "systemMicUnavailable"
+  | "micRanking"
+  | "currentMic"
+  | "searchResults"
+  | "wifiScanResults"
+  | "lastLog"
+  | "otherBtConnected"
+  | "galleryModeEnabled"
+>
+
+export type BluetoothSdkEventMap = {
+  native_notification_status: NativeNotificationStatus
+  native_notification_delivery: NativeNotificationDelivery
+  log: LogEvent
+  device_discovered: Device
+  default_device_changed: {device?: Device}
+  glasses_not_ready: GlassesNotReadyEvent
+  button_press: ButtonPressEvent
+  touch_event: TouchEvent
+  accel_event: AccelEvent
+  head_up: HeadUpEvent
+  voice_activity_detection_status: VoiceActivityDetectionStatusEvent
+  speaking_status: SpeakingStatusEvent
+  battery_status: BatteryStatusEvent
+  wake_word: WakeWordEvent
+  speech_activity: SpeechActivityEvent
+  local_transcription: LocalTranscriptionEvent
+  wifi_status_change: WifiStatusChangeEvent
+  wifi_scan_result: WifiScanResultEvent
+  wifi_forget_result: WifiForgetResultEvent
+  saved_wifi_networks: SavedWifiNetworksEvent
+  hotspot_status_change: HotspotStatusChangeEvent
+  hotspot_error: HotspotErrorEvent
+  photo_response: PhotoResponseEvent
+  photo_status: PhotoStatusEvent
+  camera_status: CameraStatusEvent
+  video_recording_status: VideoRecordingStatusEvent
+  media_success: MediaUploadSuccessEvent
+  media_error: MediaUploadErrorEvent
+  gallery_status: GalleryStatusEvent
+  compatible_glasses_search_stop: CompatibleGlassesSearchStopEvent
+  swipe_volume_status: SwipeVolumeStatusEvent
+  switch_status: SwitchStatusEvent
+  mic_tuning_state: MicTuningStateEvent
+  mic_rms: MicRmsEvent
+  wear_state: WearStateEvent
+  wear_tuning: WearTuningEvent
+  rgb_led_control_response: RgbLedControlResponseEvent
+  settings_ack: SettingsAckEvent
+  pair_failure: PairFailureEvent
+  pairing_info: PairingInfoEvent
+  entering_pairing_mode: EnteringPairingModeEvent
+  pairing_mode_ended: PairingModeEndedEvent
+  pairing_state_changed: PairingStateChangedEvent
+  audio_setup_changed: AudioSetupChangedEvent
+  /** @deprecated No longer emitted. Use `pairing_state_changed`. */
+  owner_replaced: OwnerReplacedEvent
+  audio_pairing_needed: AudioPairingNeededEvent
+  audio_connected: AudioConnectedEvent
+  audio_disconnected: AudioDisconnectedEvent
+  mic_pcm: MicPcmEvent
+  mic_lc3: MicLc3Event
+  mic_health: MicHealthEvent
+  stream_status: StreamStatusEvent
+  /** Mentra Live MTK updater completed and the glasses are about to restart. */
+  mtk_update_complete: MtkUpdateCompleteEvent
+  /** The ASG process restarted while the BES kept the BLE connection alive. */
+  glasses_session_changed: GlassesSessionChangedEvent
+  ota_start_ack: OtaStartAckEvent
+  ota_status: OtaStatusEvent
+  ar99_ota_status: Ar99OtaStatusEvent
+  /** Mentra Live stored a BES crash incident for the phone to report. */
+  bes_crash_detected: BesCrashDetectedEvent
+  version_info: VersionInfoEvent
+  extraction_progress: ExtractionProgressEvent
+}
+
+export type BluetoothSdkEventName = keyof BluetoothSdkEventMap
+
+export type BluetoothSdkEventListener<EventName extends BluetoothSdkEventName> = (
+  event: BluetoothSdkEventMap[EventName],
+) => void
+
+export type BluetoothSdkSubscription = {
+  remove(): void
+}
+
+export type BluetoothSdkEvent = BluetoothSdkEventMap[BluetoothSdkEventName]
+
+export interface BluetoothSdkPublicModule {
+  configureNativeNotifications(config: NativeNotificationConfig): Promise<void>
+  getNativeNotificationStatus(): Promise<NativeNotificationStatus>
+  addListener<EventName extends BluetoothSdkEventName>(
+    eventName: EventName,
+    listener: BluetoothSdkEventListener<EventName>,
+  ): BluetoothSdkSubscription
+
+  /** Read an immutable snapshot of the current glasses state. */
+  getGlassesStatus(): Promise<PublicGlassesStatus>
+  /** Read an immutable snapshot of the phone Bluetooth adapter state. */
+  getBluetoothStatus(): Promise<PublicBluetoothStatus>
+  /** Observe immutable glasses-state patches. Returns an unsubscribe function. */
+  subscribeGlassesStatus(listener: (changed: Partial<PublicGlassesStatus>) => void): () => void
+  /** Observe immutable Bluetooth-state patches. Returns an unsubscribe function. */
+  subscribeBluetoothStatus(listener: (changed: Partial<PublicBluetoothStatus>) => void): () => void
+
+  getDefaultDevice(): Promise<Device | null>
+  setDefaultDevice(device: Device | null): Promise<void>
+
+  startScan(model: DeviceModel): Promise<void>
+  stopScan(): Promise<void>
+  scan(options: ScanOptions): Promise<Device[]>
+  scan(model: DeviceModel, options?: ScanModelOptions): Promise<Device[]>
+  connect(device: Device, options?: ConnectOptions): Promise<void>
+  connectDefault(options?: ConnectOptions): Promise<void>
+  cancelConnectionAttempt(): Promise<void>
+  disconnect(): Promise<void>
+  forget(): Promise<void>
+  /** Unpair the glasses: disconnect, forget them as the default device and, on Mentra Live, remove the phone's Bluetooth
+   * bond, so the next pairing starts from pairing mode. */
+  unpair(): Promise<void>
+
+  displayText(text: string, x?: number, y?: number, size?: number): Promise<void>
+  clearDisplay(): Promise<void>
+  /** Set session-only content below the dashboard status header. Pass an empty string to reset it. */
+  setDashboardContent(content: string): Promise<void>
+  showDashboard(): Promise<void>
+  setDashboardPosition(height: number, depth: number): Promise<void>
+  setHeadUpAngle(angleDegrees: number): Promise<void>
+  setImuEnabled(enabled: boolean): Promise<void>
+  setScreenDisabled(disabled: boolean): Promise<void>
+  /** Keep legacy Mentra Live OTA sessions awake. Modern sessions normally do not require this. */
+  ping(): Promise<void>
+
+  requestWifiScan(): Promise<WifiSearchResult[]>
+  /** List exact WiFi SSIDs from glasses that support reliable saved-network enumeration. */
+  getSavedWifiNetworks(): Promise<SavedWifiNetworksResult>
+  sendWifiCredentials(ssid: string, password: string): Promise<WifiStatusChangeEvent>
+  /** Forget a saved network and return its correlated semantic outcome. */
+  forgetWifiNetwork(ssid: string): Promise<WifiForgetResult>
+  setHotspotState(enabled: boolean): Promise<HotspotStatusChangeEvent>
+  /** Set the glasses clock from the phone after an OTA clock-skew failure. */
+  setSystemTime(timestampMs: number): Promise<void>
+  /** Enable or disable Wi-Fi ADB on Mentra Live (no-op on other devices). */
+  /** When supplied, binds native admission to this full MAC observed in the current BLE session.
+   * Resolves on queue admission, without confirming glasses-side state. */
+  setWifiAdbState(enabled: boolean, expectedBluetoothMac?: string): Promise<void>
+
+  /**
+   * Persistently enable/disable unauthenticated HTTP gallery access on the glasses' Wi-Fi.
+   * Default off; survives reconnects/restarts until disabled. Only use on trusted networks.
+   * Returns saved enabled state plus current listening/url. No Wi-Fi means listening=false.
+   */
+  setGalleryServerEnabled(enabled: boolean): Promise<SettingsAckSuccessEvent>
+  /** Mentra Live only. Keep gesture events; reset stock actions on BLE disconnect. Requires compatible BES firmware. */
+  setTouchGestureDefaultBehaviorEnabled(gesture: TouchGesture, enabled: boolean): Promise<SettingsAckSuccessEvent>
+  setGalleryModeEnabled(enabled: boolean): Promise<SettingsAckSuccessEvent>
+  setVoiceActivityDetectionEnabled(enabled: boolean): Promise<void>
+  setLoudnessGateEnabled(enabled: boolean): Promise<void>
+  setAutoPowerOffEnabled(enabled: boolean): Promise<void>
+  /**
+   * @deprecated Sticky action-button photo presets are deprecated. Prefer per-request
+   * `requestPhoto(...)` options (e.g. `mode: "text"` for text sensor size/crop, or explicit per-shot
+   * fields). Still functional until removed in a future release.
+   */
+  setPhotoCaptureDefaults(settings: PhotoCaptureDefaults): Promise<SettingsAckSuccessEvent>
+  setVideoRecordingDefaults(settings: VideoRecordingDefaults): Promise<SettingsAckSuccessEvent>
+  setMaxVideoRecordingDuration(minutes: number): Promise<SettingsAckSuccessEvent>
+  setCameraFov(request: CameraFovRequest): Promise<CameraFovResult>
+  /** One-way FOV command for legacy ASG clients that do not send settings acknowledgements. */
+  setLegacyCameraFov(request: CameraFovRequest): Promise<CameraFovResult>
+  setCameraFovOverride(request: CameraFovOverrideRequest): Promise<CameraFovResult>
+  releaseCameraFovOverride(leaseId: string): Promise<SettingsAckSuccessEvent>
+  /**
+   * Configure camera HAL tuning (ANR / gain) on Mentra Live glasses.
+   *
+   * The phone sends a {@code camera_tuning_config} BLE command; the glasses relay it as a
+   * {@code camconfig} broadcast to the camera HAL so parameters take effect without a reboot.
+   *
+   * **Scan-mode convention**: call with `(false, false)` when activating scan mode to disable ANR
+   * and pixsmart gain for sharper text/barcode captures. Call with `(true, true)` to restore
+   * defaults when exiting scan mode.
+   *
+   * @param anrOn  `true` = ANR enabled (default), `false` = ANR disabled
+   * @param gainOn `true` = stock gain params (default), `false` = pixsmart gain-off params
+   */
+  setCameraTuningConfig(anrOn: boolean, gainOn: boolean): Promise<SettingsAckSuccessEvent>
+  queryGalleryStatus(): Promise<GalleryStatusEvent>
+  requestPhoto(params: PhotoRequestParams): Promise<PhotoSuccessResponseEvent>
+  warmUpCamera(params: WarmUpCameraParams): Promise<CameraStatusEvent>
+  /** Release one request-owned warm-up. Opening requests reject with camera_warm_up_cancelled. */
+  stopCameraWarmUp(requestId: string): Promise<void>
+  startVideoRecording(
+    requestId: string,
+    save: boolean,
+    sound: boolean,
+    settings?: VideoRecordingSettings,
+  ): Promise<VideoRecordingStartedStatusEvent>
+  /**
+   * Stop the active recording. When {@link webhookUrl} is provided, the glasses
+   * upload the recorded video to it (multipart) using {@link authToken}. These
+   * are supplied at stop time (not start) so the token is fresh when the upload
+   * runs 闂?a recording can last arbitrarily long. An empty/omitted webhook keeps
+   * the video on device (no upload).
+   */
+  stopVideoRecording(
+    requestId: string,
+    webhookUrl?: string,
+    authToken?: string,
+  ): Promise<VideoRecordingStoppedStatusEvent>
+  /** Query the glasses for the current recording state and elapsed duration. */
+  queryVideoRecordingStatus(requestId: string): Promise<VideoRecordingStatusEvent>
+
+  startStream(params: StreamStartRequest): Promise<StreamStatusEvent>
+  stopStream(): Promise<StreamStatusEvent>
+
+  setMicState(enabled: boolean, useGlassesMic?: boolean, sendTranscript?: boolean, sendLc3Data?: boolean): Promise<void>
+  setPreferredMic(preferredMic: MicPreference): Promise<void>
+  setOwnAppAudioPlaying(playing: boolean): Promise<void>
+  getGlassesMediaVolume(): Promise<GlassesMediaVolumeGetResult>
+  setGlassesMediaVolume(level: number): Promise<GlassesMediaVolumeSetResult>
+
+  rgbLedControl(
+    requestId: string,
+    packageName: string | null,
+    action: RgbLedAction,
+    color: RgbLedColor | null,
+    onDurationMs: number,
+    offDurationMs: number,
+    count: number,
+  ): Promise<RgbLedControlSuccessResponseEvent>
+
+  requestVersionInfo(): Promise<VersionInfoResult>
+  /**
+   * Select the OTA manifest used by subsequent update checks and installs.
+   * The URL may point at Mentra's hosted manifest or any customer-controlled HTTP(S) server.
+   */
+  setOtaVersionUrl(otaVersionUrl: string): void
+  /** Return the configured or release-embedded OTA manifest URL. Rejects when a source build is unconfigured. */
+  getOtaVersionUrl(): string
+  /** Fetch the configured OTA manifest and return whether any ASG/BES/MTK update is available. */
+  checkForOtaUpdate(): Promise<boolean>
+  /** Return bundled release changelogs crossed between two coordinated product versions, newest first. */
+  getReleaseChangelogs(fromVersion?: string | null, toVersion?: string | null): ReleaseChangelog[]
+  /** Start OTA from the configured or explicitly supplied manifest URL. */
+  startOtaUpdate(otaVersionUrl?: string | null): Promise<OtaStartAckEvent>
+  /** Query the active OTA session and return the correlated status response. */
+  queryOtaStatus(): Promise<OtaQueryResult>
+  startAr99OtaFromFile(path: string): Promise<boolean>
+  cancelAr99Ota(): Promise<void>
+  sendAr99FactoryReset(): Promise<void>
+  buildAr99OtaSignature(
+    secret: string,
+    appName: string,
+    currentVersion: string,
+    serialNumber: string,
+    nonce: string,
+  ): string
+
+  // // stt commands (MOVE TO CRUST)
+  // setSttModelDetails(path: string, languageCode: string): Promise<void>
+  // getSttModelPath(): Promise<string>
+  // checkSttModelAvailable(): Promise<boolean>
+  // validateSttModel(path: string): Promise<boolean>
+  // extractTarBz2(sourcePath: string, destinationPath: string): Promise<boolean>
+
+  // // tts commands (MOVE TO CRUST)
+  // setTtsModelDetails(path: string, languageCode: string): Promise<void>
+  // getTtsModelPath(): Promise<string>
+  // getTtsModelLanguage(): Promise<string>
+  // checkTtsModelAvailable(): Promise<boolean>
+  // validateTtsModel(path: string): Promise<boolean>
+  // generateTtsAudio(text: string, path: string, outputPath: string, speakerId: number, speed: number): Promise<boolean>
+
+  // STT Commands (TODO: MOVE TO CRUST)
+  setSttModelDetails(path: string, languageCode: string): Promise<void>
+  getSttModelPath(): Promise<string>
+  checkSttModelAvailable(): Promise<boolean>
+  validateSttModel(path: string): Promise<boolean>
+  extractTarBz2(sourcePath: string, destinationPath: string): Promise<boolean>
+  /**
+   * Start or stop on-device keyword spotting on microphone PCM. `modelDir` must contain
+   * `encoder.int8.onnx`, `decoder.onnx`, `joiner.int8.onnx`, `tokens.txt` and `keywords.txt`;
+   * it is required when enabling. Disabling releases the model.
+   */
+  setWakeWordDetection(enabled: boolean, modelDir?: string | null): Promise<void>
+  /**
+   * Finalize the active on-device recognizer's current utterance now. Resolves after the final
+   * `local_transcription` event for it has been emitted, with that final text (empty when nothing
+   * was pending). Resolves `null` when no streaming model is active or the loaded model can't
+   * finalize early.
+   */
+  finishTranscription(): Promise<string | null>
+  /**
+   * Reload the selected speech model when on-device transcription is in demand. Resolves after
+   * it is loaded; rejects when loading fails; resolves immediately when there is no demand.
+   */
+  restartTranscriber(): Promise<void>
+  /**
+   * Start or stop the on-device Silero speech detector on microphone PCM. While enabled it emits
+   * `speech_activity` transitions; `minSilenceMs` (default 300) is the quiet gap before a silence
+   * transition. Disabling releases the model.
+   */
+  setSpeechActivityDetection(enabled: boolean, options?: {minSilenceMs?: number}): Promise<void>
+
+  // TTS Commands (TODO: MOVE TO CRUST)
+  setTtsModelDetails(path: string, languageCode: string): Promise<void>
+  getTtsModelPath(): Promise<string>
+  getTtsModelLanguage(): Promise<string>
+  checkTtsModelAvailable(): Promise<boolean>
+  validateTtsModel(path: string): Promise<boolean>
+  generateTtsAudio(
+    text: string,
+    modelPath: string,
+    outputPath: string,
+    speakerId: number,
+    speed: number,
+  ): Promise<boolean>
+}
+
+// OTA update status types
+export type OtaStage = "download" | "install"
+export type OtaProgressStatus = "STARTED" | "PROGRESS" | "FINISHED" | "FAILED"
+
+export interface OtaStatus {
+  sessionId: string
+  totalSteps: number
+  currentStep: number
+  stepType: "apk" | "mtk" | "bes"
+  phase: "download" | "install"
+  stepPercent: number
+  /** Real bytes received in the current download; independent of rounded percent. */
+  bytesDownloaded?: number
+  overallPercent: number
+  status: "in_progress" | "step_complete" | "complete" | "failed" | "idle"
+  error?: string
+}
+
+export interface OtaUpdateInfo {
+  available: boolean
+  versionCode: number
+  versionName: string
+  updates: string[] // ["apk", "mtk", "bes"]
+  totalSize: number
+  cacheReady?: boolean
+  /** Exact BES target selected from the OTA manifest, when a BES step is pending. */
+  besVersion?: string
+  /** True when the APK step installs an older build than the glasses currently run (exact-pin manifests only). */
+  isDowngrade?: boolean
+}
+
+export interface ReleaseChangelog {
+  /** Base production version, for example `3.1.0`. */
+  version: string
+  /** Markdown body authored in `/changelogs/<version>.md`. */
+  markdown: string
+}
+
+export interface OtaProgress {
+  stage: OtaStage
+  status: OtaProgressStatus
+  progress: number
+  bytesDownloaded: number
+  totalBytes: number
+  currentUpdate: string
+  errorMessage?: string
+}
+
+export interface GlassesStatus {
+  /** iOS G2 arm still disconnected after a three-second partial link; cleared on reset or both links. */
+  g2MissingArm?: "left" | "right" | null
+  // state:
+  connection: GlassesConnectionStatus
+  micEnabled: boolean
+  voiceActivityDetectionEnabled: boolean
+  bluetoothClassicConnected: boolean
+  /** iOS: an HFP input is available or a matching Bluetooth output is active. Android: same as `bluetoothClassicConnected`. */
+  bluetoothClassicProfilesConnected: boolean
+  /** iOS: a matching Bluetooth output is the active audio route. Android: same as `bluetoothClassicConnected`. */
+  bluetoothAudioRouted: boolean
+  signalStrength: number
+  /** Milliseconds since epoch when signalStrength was last refreshed by the phone BLE stack. */
+  signalStrengthUpdatedAt: number
+  // device info
+  deviceModel: string
+  androidVersion: string
+  firmwareVersion: string
+  besFirmwareVersion: string
+  mtkFirmwareVersion: string
+  bluetoothMacAddress: string
+  wifiMacAddress: string
+  leftMacAddress: string
+  rightMacAddress: string
+  buildNumber: string
+  /** Mentra Live pairing state owned by the SDK. Absent on other models. */
+  pairingState?: MentraLivePairingState
+  /** Audio setup state owned by the SDK, on every model. See `GlassesAudioSetupState`. */
+  audioSetup?: GlassesAudioSetupState
+  /** Glasses System.currentTimeMillis() from last version_info (clock skew detection). */
+  systemTimeMs?: number
+  otaVersionUrl: string
+  appVersion: string
+  /**
+   * Package the glasses client actually runs as, from `version_info_1`. Empty string on glasses
+   * whose client predates the field. `"com.mentra.asg_client"` is the stock client; anything else
+   * is a sideloaded build (Android forces a distinct package on any build not signed with Mentra's
+   * release key) that coexists with the stock app and must not be driven by OTA.
+   */
+  packageName: string
+  /** Phone-served hotspot OTA protocol version; 0 means unsupported/legacy glasses. */
+  hotspotOtaVersion: number
+  bluetoothName: string
+  serialNumber: string
+  style: string
+  color: string
+  // wifi info
+  wifi: WifiStatus
+  // battery info
+  batteryLevel: number
+  charging: boolean
+  caseBatteryLevel: number
+  caseCharging: boolean
+  caseOpen: boolean
+  caseRemoved: boolean
+  // hotspot info
+  hotspot: HotspotStatus
+  // OTA update info
+  otaUpdateAvailable: OtaUpdateInfo | null
+  otaProgress: OtaProgress | null
+  otaInProgress: boolean
+  // ring info
+  controllerConnected: boolean
+  controllerFullyBooted: boolean
+  controllerMacAddress: string
+  controllerBatteryLevel: number
+  controllerSignalStrength: number
+}
+
+export interface CoreDashboardMenuItem {
+  name: string
+  packageName: string
+  running: boolean
+}
+
+export interface CalendarEvent {
+  title: string
+  location?: string
+  time: string
+  endDate: number
+}
+
+export interface CoreSettings {
+  menu_apps: CoreDashboardMenuItem[]
+  calendar_events: CalendarEvent[]
+}
+
+export interface Device {
+  /**
+   * Stable app-facing key for this scan result, within the limits of the
+   * platform identifier available to the SDK. Do not parse this value; use the
+   * typed model, name, address, projectName, and rssi fields instead.
+   */
+  id: string
+  model: DeviceModel
+  name: string
+  /** Platform address/identifier when available: Android Bluetooth address, iOS CoreBluetooth identifier. */
+  address?: string
+  /** Optional AR99 project discriminator. Supported value: AR99. */
+  projectName?: string
+  /**
+   * Optional scan signal strength. It may be undefined at first discovery and
+   * appear in a later scan update when the platform reports RSSI metadata.
+   */
+  rssi?: number
+  /** Mentra Live: unit is currently in pairing mode (adv flag). */
+  pairingMode?: boolean
+  /** Mentra Live: four-character hex spoken pairing code when available. */
+  pairingCode?: string
+  /** Mentra Live: advertisement carries the secure-pairing capability trailer. */
+  securePairingCapable?: boolean
+}
+
+export interface ConnectOptions {
+  saveAsDefault?: boolean
+  cancelExistingConnectionAttempt?: boolean
+  /**
+   * iOS Mentra Live only. When true, CoreBluetooth requires ANCS authorization
+   * as part of the connection. Set false when the app does not use notification
+   * relay and must avoid the system ANCS authorization flow. Defaults to true.
+   * Android accepts this option as a no-op.
+   */
+  requiresAncs?: boolean
+  /**
+   * iOS Mentra Live only. When true, CoreBluetooth is asked to bring up the
+   * Classic profiles (A2DP/HFP) after the BLE connection
+   * (CBConnectPeripheralOptionEnableTransportBridgingKey). Defaults to true:
+   * without it the pairing screen waits for an audio route that never appears.
+   * Android accepts this option as a no-op.
+   */
+  enableTransportBridging?: boolean
+}
+
+export type ScanResultsCallback = (devices: Device[]) => void
+
+/** Advisory for an empty scan. System connection state does not identify an owning app. */
+export interface ScanDiagnostic {
+  code: string
+  message: string
+}
+
+export interface ScanOptions {
+  model: DeviceModel
+  /** Defaults to 15000. */
+  timeoutMs?: number
+  /** Alias for `timeoutMs`, useful when mirroring native examples. */
+  timeout?: number
+  /** Called every time the discovered device list changes during the scan. */
+  onResults?: ScanResultsCallback
+  /** Optional non-fatal hint before an empty scan resolves, on Android and iOS. */
+  onDiagnostic?: (diagnostic: ScanDiagnostic) => void
+}
+
+export type ScanModelOptions = Omit<ScanOptions, "model">
+
+export interface WifiSearchResult {
+  ssid: string
+  requiresPassword: boolean
+  signalStrength: number
+  /** Frequency in MHz (from glasses scan). 5 GHz band is typically 5170闂?825. Omitted if unknown. */
+  frequency?: number
+}
+
+export interface BluetoothStatus {
+  // state:
+  searching: boolean
+  searchingController: boolean
+  default_wearable?: DeviceModel | ""
+  pending_wearable?: DeviceModel | ""
+  device_name?: string
+  device_address?: string
+  default_controller?: DeviceModel | ""
+  pending_controller?: DeviceModel | ""
+  controller_device_name?: string
+  controller_address?: string
+  systemMicUnavailable: boolean
+  micRanking: MicMode[]
+  currentMic: MicMode | "" | null
+  /**
+   * Nearby glasses in stable discovery order.
+   * Existing entries keep their array position as details refresh; new glasses append at the end,
+   * and removals should not reorder remaining entries.
+   */
+  searchResults: Device[]
+  wifiScanResults: WifiSearchResult[]
+  lastLog: string[]
+  otherBtConnected: boolean
+  // desired settings the SDK sends to compatible connected glasses:
+  galleryModeEnabled: boolean
+}
+
+export type BluetoothSettingsUpdate = Partial<{
+  auth_email: string
+  core_token: string
+  sensing_enabled: boolean
+  power_saving_mode: boolean
+  lc3_frame_size: number
+  preferred_mic: MicPreference
+  screen_disabled: boolean
+  contextual_dashboard: boolean
+  head_up_angle: number
+  imu_enabled: boolean
+  brightness: number
+  auto_brightness: boolean
+  dashboard_height: number
+  dashboard_depth: number
+  menu_apps: DashboardMenuItem[] | CoreDashboardMenuItem[] | Array<Record<string, unknown>> | null
+  calendar_events: CalendarEvent[]
+  metric_system: boolean
+  twelve_hour_time: boolean
+  gallery_mode: boolean
+  voice_activity_detection_enabled: boolean
+  loudness_gate_enabled: boolean
+  auto_power_off_enabled: boolean
+  /** Effective mic tuning only. `{}` means "reset to firmware defaults". */
+  mic_tuning: MicTuning
+  button_photo_size: ButtonPhotoSize
+  button_video_settings: {width: number; height: number; fps: number}
+  button_video_width: number
+  button_video_height: number
+  button_video_fps: number
+  button_max_recording_time: number
+  camera_fov: NativeCameraFovSetting
+  should_send_pcm: boolean
+  should_send_lc3: boolean
+  should_send_transcript: boolean
+  offline_mode: boolean
+  local_stt_fallback_active: boolean
+  pending_wearable: DeviceModel | ""
+  default_wearable: DeviceModel | ""
+  device_name: string
+  device_address: string
+  default_controller: DeviceModel | ""
+  pending_controller: DeviceModel | ""
+  controller_device_name: string
+  controller_address: string
+}>

@@ -1,0 +1,35 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "jsx": "react-jsx",
+    "strict": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "paths": {
+      "@mentra/miniapp": ["./packages/miniapp/src/index.ts"],
+      "@mentra/miniapp/*": ["./packages/miniapp/src/*"],
+      "@mentra/bluetooth-sdk": ["./packages/bluetooth-sdk/src/index.ts"],
+      "@mentra/bluetooth-sdk/internal": ["./packages/bluetooth-sdk/src/_internal.ts"],
+      "@mentra/bluetooth-sdk/*": ["./packages/bluetooth-sdk/src/*"],
+      "@mentra/miniapp-cli": ["./packages/miniapp-cli/src/index.ts"],
+      "@mentra/miniapp-cli/*": ["./packages/miniapp-cli/src/*"],
+      "@mentra/cloud-protocol": ["./packages/cloud-protocol/src/index.ts"],
+      "@mentra/cloud-protocol/*": ["./packages/cloud-protocol/src/*"]
+    }
+  },
+  "include": [
+    "engine/src/**/*.ts",
+    "packages/*/src/**/*.ts",
+    "translation-miniapp/src/**/*.ts",
+    "translation-miniapp/src/**/*.tsx",
+    "translation-miniapp/build.ts"
+  ],
+  "exclude": ["**/*.test.ts", "**/*.test.tsx", "**/__tests__/**", "**/node_modules/**"]
+}

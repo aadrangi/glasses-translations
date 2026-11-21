@@ -25,10 +25,10 @@ Mentra App (React Native host)
 | Pair/own the G1 | `vendor/.../ios/Source/sgcs/G1.swift` | G1 accepts ONE BLE peer; quit Even Realities app first |
 | Mic frames | `didReceiveMicLc3` event (`events/BluetoothEvents.swift`) | 20 ms LC3 frames, 16 kHz |
 | LC3 -> PCM | `Packages/CoreObjC` (`lc3_cpp.h`) | already compiled into the pod |
-| Speech -> text | `Source/stt/SherpaOnnxTranscriber.swift` + vendored `Packages/SherpaOnnx/sherpa-onnx.xcframework` | streaming zipformer models from https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/ (see `reference/STTModelManager.ts` for the URL list + a vosk HF model). Per-language models; add a language detector or let the user pick. |
+| Speech -> text | `Source/stt/SherpaOnnxTranscriber.swift` + vendored `Packages/SherpaOnnx/sherpa-onnx.xcframework` | streaming zipformer models from https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/ (see `reference/engine/src/services/STTModelManager.ts` for the URL list + a vosk HF model). Per-language models; add a language detector or let the user pick. |
 | VAD (optional) | `Source/stt/SileroSpeechActivity.swift` + `Resources/SileroVad/silero_vad.onnx` | speech gating |
 | Text -> translated text | **NEW — nothing in-repo.** Use Apple `Translation` framework (iOS 26, on-device, iPhone 17 Pro Max qualifies) or bundle CTranslate2/Argos | the only genuinely missing piece |
-| Layout for G1 display | `Source/utils/G1Text.swift` (+ `reference/display/` TS profiles as the spec: 576 px, 5 lines, glyph widths, kinsoku) | native Swift path already embeds the metrics |
+| Layout for G1 display | `Source/utils/G1Text.swift` (+ `reference/engine/src/utils/display/` TS profiles as the spec: 576 px, 5 lines, glyph widths, kinsoku) | native Swift path already embeds the metrics |
 | Render | `G1.displayTextWall(...)` (cmd 0x4E), ~300 ms throttle | |
 
 ## CocoaPods surface (from MentraBluetoothSDK.podspec)
@@ -54,7 +54,7 @@ app needs the same modes to translate with the screen off.
 - G1 text sanitizer / embedded glyph set: unsupported characters must be
   mapped before send — see `reference/g1-character-support.md` and
   `Source/sgcs/G1TextSanitizer.swift`.
-- Mic policy: glasses mic vs phone mic fallback — `reference/LocalSttFallbackCoordinator.ts`
+- Mic policy: glasses mic vs phone mic fallback — `reference/engine/src/services/LocalSttFallbackCoordinator.ts`
   shows how the engine feeds PCM into the native recognizer.
 - The G1 has no speaker; output is display-only.
 - LC3 frame size differs per glasses (G1 = 20 ms, G2 = 40 ms).

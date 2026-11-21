@@ -9,9 +9,11 @@ Even Realities G1 glasses — no Mentra cloud, no server.
   (`sgcs/G1.swift`), text-wall renderer (`utils/G1Text.swift`), on-device
   sherpa-onnx STT (`Source/stt/`), LC3 decoder (`Packages/CoreObjC`), vendored
   `sherpa-onnx.xcframework`. Podspec: `vendor/bluetooth-sdk/ios/MentraBluetoothSDK.podspec`
-- `reference/` — device-agnostic logic to port: the Translation miniapp
-  (formatting/session logic), G1 display profiles (text wrapping spec), G1
-  capabilities, on-device STT wiring, character-support notes
+- `reference/` — importable Bun workspace: the Translation miniapp, the
+  `@mentra/miniapp` / `@mentra/bluetooth-sdk` / `@mentra/miniapp-cli` /
+  `@mentra/cloud-protocol` packages, and the engine files (G1 display profiles,
+  capabilities, on-device STT wiring). All `@mentra/*` imports resolve locally:
+  `cd reference && bun install && bun run typecheck` passes clean.
 
 ## Planned pipeline
 
@@ -27,7 +29,8 @@ everything else is vendored here.
    (see podspec deps in `docs/pipeline-map.md`; drop `UltraliteSDK`/Mach1).
 2. Use `MentraBluetoothSDK` publicly: scan/connect, subscribe `didReceiveMicLc3`,
    render via the display/text-wall API.
-3. Download a sherpa-onnx streaming model (URLs in `reference/STTModelManager.ts`)
+3. Download a sherpa-onnx streaming model (URLs in
+   `reference/engine/src/services/STTModelManager.ts`)
    and feed decoded PCM into the recognizer.
 4. Add `TranslationSession` (Apple Translation framework) between STT and display.
 5. Enable `bluetooth-central` + `audio` background modes for screen-off use.

@@ -1,0 +1,1 @@
+{"version":3,"file":"capsuleHeaderLayout.js","sourceRoot":"","sources":["../../src/react/capsuleHeaderLayout.ts"],"names":[],"mappings":"AAEA,MAAM,UAAU,4BAA4B,CAC1C,WAAmC,EACnC,aAAqB,EACrB,aAAqB,EACrB,QAAgB;IAEhB,MAAM,6BAA6B,GAAG,aAAa,GAAG,WAAW,CAAC,IAAI,GAAG,aAAa,CAAA;IACtF,OAAO,IAAI,CAAC,GAAG,CAAC,QAAQ,EAAE,6BAA6B,GAAG,QAAQ,CAAC,CAAA;AACrE,CAAC"}
