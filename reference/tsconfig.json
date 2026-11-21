@@ -18,8 +18,6 @@
       "@mentra/bluetooth-sdk": ["./packages/bluetooth-sdk/src/index.ts"],
       "@mentra/bluetooth-sdk/internal": ["./packages/bluetooth-sdk/src/_internal.ts"],
       "@mentra/bluetooth-sdk/*": ["./packages/bluetooth-sdk/src/*"],
-      "@mentra/miniapp-cli": ["./packages/miniapp-cli/src/index.ts"],
-      "@mentra/miniapp-cli/*": ["./packages/miniapp-cli/src/*"],
       "@mentra/cloud-protocol": ["./packages/cloud-protocol/src/index.ts"],
       "@mentra/cloud-protocol/*": ["./packages/cloud-protocol/src/*"]
     }
@@ -28,8 +26,7 @@
     "engine/src/**/*.ts",
     "packages/*/src/**/*.ts",
     "translation-miniapp/src/**/*.ts",
-    "translation-miniapp/src/**/*.tsx",
-    "translation-miniapp/build.ts"
+    "translation-miniapp/src/**/*.tsx"
   ],
   "exclude": ["**/*.test.ts", "**/*.test.tsx", "**/__tests__/**", "**/node_modules/**"]
 }

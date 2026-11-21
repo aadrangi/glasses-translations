@@ -25,7 +25,7 @@ Pod::Spec.new do |s|
   # External dependencies required by Bluetooth SDK native code
   s.dependency 'ExpoModulesCore' if include_expo_adapter
   s.ios.dependency 'SWCompression', '~> 4.8.0'
-  s.ios.dependency 'SwiftProtobuf', '~> 1.0'
+  # G1-only fork: SwiftProtobuf (AR99 protobuf) and UltraliteSDK (Mach1) deps removed.
   s.ios.dependency 'onnxruntime-objc', '1.18.0'
 
   # Swift/Objective-C compatibility
@@ -50,9 +50,7 @@ Pod::Spec.new do |s|
   s.ios.vendored_frameworks = 'Packages/SherpaOnnx/sherpa-onnx.xcframework'
 
   s.resource_bundles = {
-    'BluetoothSDKPrivacy' => ['Source/PrivacyInfo.xcprivacy'],
-    # NIMO firmware the SGC installs when connected glasses report another version.
-    'MentraNimoFirmware' => ['Resources/NimoFirmware/*.bin']
+    'BluetoothSDKPrivacy' => ['Source/PrivacyInfo.xcprivacy']
   }
   # Phone-side Silero speech activity runs through the iOS-only sherpa-onnx framework.
   s.ios.resource_bundles = {

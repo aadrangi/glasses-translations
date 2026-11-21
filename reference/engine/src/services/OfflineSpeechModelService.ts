@@ -1,13 +1,11 @@
 // import NetInfo from "@react-native-community/netinfo"
 
 import STTModelManager from "./STTModelManager"
-import TTSModelManager from "./TTSModelManager"
-import WakeWordModelManager from "./WakeWordModelManager"
 
 export type DownloadStage = "idle" | "downloading" | "extracting" | "complete" | "failed"
 
 export interface DownloadStatus {
-  kind: "stt" | "tts" | "wakeword"
+  kind: "stt"
   languageCode: string
   stage: DownloadStage
   /** 0–100, only meaningful while stage is "downloading" or "extracting". */
@@ -25,7 +23,6 @@ class OfflineSpeechModelService {
   private static instance: OfflineSpeechModelService
   private started = false
   private sttPromise: Promise<void> | null = null
-  private ttsPromise: Promise<void> | null = null
 
   private currentStatus: DownloadStatus | null = null
   private listeners = new Set<StatusListener>()
@@ -88,22 +85,10 @@ class OfflineSpeechModelService {
   }
 
   async ensureDefaultModels(): Promise<void> {
-    // Sequence STT, TTS, then the wake word so the Speech page shows one
-    // coherent progress at a time. STT first because it's the primary use case.
     try {
       await this.ensureSttModel()
     } catch (error) {
       console.warn("OFFLINE_MODELS: STT model setup failed:", error)
-    }
-    try {
-      await this.ensureTtsModel()
-    } catch (error) {
-      console.warn("OFFLINE_MODELS: TTS model setup failed:", error)
-    }
-    try {
-      await this.downloadWakeWordModel()
-    } catch (error) {
-      console.warn("OFFLINE_MODELS: wake-word model setup failed:", error)
     }
   }
 
@@ -115,14 +100,6 @@ class OfflineSpeechModelService {
     return this.sttPromise
   }
 
-  async ensureTtsModel(): Promise<void> {
-    if (this.ttsPromise) return this.ttsPromise
-    this.ttsPromise = this.ensureTtsModelInner().finally(() => {
-      this.ttsPromise = null
-    })
-    return this.ttsPromise
-  }
-
   /**
    * Download an STT model with its progress on the Speech page. Joins a
    * download of the same model that is already running. Never changes the
@@ -132,14 +109,6 @@ class OfflineSpeechModelService {
     if (await STTModelManager.isModelAvailable(code)) return
     await this.track("stt", code, onProgress, (progress, extraction) =>
       STTModelManager.downloadModel(code, progress, extraction),
-    )
-  }
-
-  /** Download the wake-word model with its progress on the Speech page. */
-  async downloadWakeWordModel(onProgress?: (percent: number) => void): Promise<void> {
-    if (await WakeWordModelManager.isModelAvailable()) return
-    await this.track("wakeword", WakeWordModelManager.code, onProgress, (progress, extraction) =>
-      WakeWordModelManager.downloadModel(progress, extraction),
     )
   }
 
@@ -203,22 +172,6 @@ class OfflineSpeechModelService {
     if (STTModelManager.getCurrentLanguage() === legacy) await STTModelManager.activateLanguage(replacement)
     await STTModelManager.deleteModel(legacy)
     console.log(`OFFLINE_MODELS: STT model ${legacy} replaced by ${replacement}`)
-  }
-
-  private async ensureTtsModelInner(): Promise<void> {
-    const preferred = await TTSModelManager.getCurrentLanguageFromPreferences()
-    const code = preferred || TTSModelManager.getCurrentLanguage()
-
-    if (await TTSModelManager.isModelAvailable(code)) {
-      await TTSModelManager.activateLanguage(code)
-      console.log(`OFFLINE_MODELS: TTS model ready: ${code}`)
-      return
-    }
-
-    await this.track("tts", code, undefined, (progress, extraction) =>
-      TTSModelManager.downloadModel(code, progress, extraction),
-    )
-    await TTSModelManager.activateLanguage(code)
   }
 }
 

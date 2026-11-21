@@ -7,10 +7,13 @@ Even Realities G1 glasses — no Mentra cloud, no server.
   commands, rules). Read it first if you are an agent.
 - `UPSTREAM.md` — provenance (MentraOS commit, Apache-2.0) + re-sync notes
 - `docs/pipeline-map.md` — what every component does and what to reuse vs build
-- `vendor/bluetooth-sdk/` — Mentra Bluetooth SDK iOS sources: the G1 BLE driver
-  (`sgcs/G1.swift`), text-wall renderer (`utils/G1Text.swift`), on-device
-  sherpa-onnx STT (`Source/stt/`), LC3 decoder (`Packages/CoreObjC`), vendored
-  `sherpa-onnx.xcframework`. Podspec: `vendor/bluetooth-sdk/ios/MentraBluetoothSDK.podspec`
+- `vendor/bluetooth-sdk/` — Mentra Bluetooth SDK iOS sources, **G1-only** after
+  the 2026-11-20 pruning: G1 BLE driver (`sgcs/G1.swift`), text-wall renderer
+  (`utils/G1Text.swift`), on-device sherpa-onnx STT (`Source/stt/`), LC3
+  decoder (`Packages/CoreObjC`), vendored `sherpa-onnx.xcframework`. Other
+  glasses drivers deleted; device-specific commands stubbed as
+  `unsupported_device` (see `UPSTREAM.md`).
+  Podspec: `vendor/bluetooth-sdk/ios/MentraBluetoothSDK.podspec`
 - `reference/` — importable Bun workspace: the Translation miniapp, the
   `@mentra/miniapp` / `@mentra/bluetooth-sdk` / `@mentra/miniapp-cli` /
   `@mentra/cloud-protocol` packages, and the engine files (G1 display profiles,

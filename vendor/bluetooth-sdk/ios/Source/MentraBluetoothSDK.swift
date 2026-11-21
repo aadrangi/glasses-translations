@@ -542,7 +542,7 @@ public final class MentraBluetoothSDK {
         let isController = ControllerTypes.ALL.contains(device.model.deviceType)
         if !isController {
             requiresAncsForBluetoothRestore = options.requiresAncs
-            MentraLive.enableTransportBridging = options.enableTransportBridging
+            // G1-only build: Mentra Live transport bridging was removed.
         }
         if options.cancelExistingConnectionAttempt {
             if isController {
@@ -550,9 +550,6 @@ public final class MentraBluetoothSDK {
             } else {
                 cancelConnectionAttempt()
             }
-        }
-        if !isController {
-            MentraLive.clearStaleIosBondPrompt()
         }
         if options.saveAsDefault && !isController {
             setDefaultDevice(device)
@@ -572,7 +569,7 @@ public final class MentraBluetoothSDK {
     public func connectDefault(options: ConnectOptions = ConnectOptions()) throws {
         clearBluetoothRestoreIntent()
         requiresAncsForBluetoothRestore = options.requiresAncs
-        MentraLive.enableTransportBridging = options.enableTransportBridging
+        // G1-only build: Mentra Live transport bridging was removed.
         guard let device = currentDefaultDevice() else {
             throw BluetoothSdkError(
                 code: "default_device_missing",

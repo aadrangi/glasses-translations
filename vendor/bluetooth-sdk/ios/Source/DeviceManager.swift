@@ -765,26 +765,11 @@ struct ViewState {
             Bridge.log("MAN: SGC already initialized")
             return
         }
-        if wearable.contains(DeviceTypes.SIMULATED) {
-            sgc = Simulated()
-        } else if wearable.contains(DeviceTypes.G1) {
+        // G1-only build: drivers for Simulated, G2, Mentra Live, NIMO, AR99,
+        // Frame and Mentra Nex were removed with this fork.
+        if wearable.contains(DeviceTypes.G1) {
             sgc = G1()
-        } else if wearable.contains(DeviceTypes.G2) {
-            sgc = G2()
-        } else if wearable.contains(DeviceTypes.LIVE) {
-            sgc = MentraLive()
-        } else if wearable.contains(DeviceTypes.NIMO) {
-            sgc = Nimo()
-        } else if wearable.contains(DeviceTypes.AR99) {
-            sgc = Ar99()
-        } else if wearable.contains(DeviceTypes.FRAME) {
-            // sgc = FrameManager()
         }
-#if !os(macOS) && (!SWIFT_PACKAGE || MENTRA_FEATURE_NEX)
-        if sgc == nil && wearable.contains(DeviceTypes.NEX) {
-            sgc = MentraNexSGC.getInstance()
-        }
-#endif
         // update device model:
         DeviceStore.shared.apply("glasses", "deviceModel", sgc?.type ?? "")
     }
@@ -802,9 +787,7 @@ struct ViewState {
             return
         }
 
-        if controllerModel == ControllerTypes.R1 {
-            controller = R1()
-        }
+        // G1-only build: the Even Realities R1 controller driver was removed.
     }
 
     @discardableResult
@@ -1603,12 +1586,7 @@ struct ViewState {
     }
 
     func setWifiAdbState(_ enabled: Bool, expectedBluetoothMac: String?) throws {
-        guard let expectedBluetoothMac else { setWifiAdbState(enabled); return }
-        guard let live = sgc as? MentraLive else {
-            throw BluetoothSdkError(code: "glasses_not_connected", message: "Mentra Live glasses are not connected.")
-        }
-        // Capture one driver; its own session identity guards the actual queue insertion.
-        try live.sendWifiAdbState(enabled, expectedBluetoothMac: expectedBluetoothMac)
+        setWifiAdbState(enabled)
     }
 
     func setWifiAdbState(_ enabled: Bool) {
@@ -1636,83 +1614,63 @@ struct ViewState {
 
     func sendOtaQueryStatus() {
         Bridge.log("MAN: 📱 Sending OTA query status command to glasses")
-        (sgc as? MentraLive)?.sendOtaQueryStatus()
+        sgc?.sendOtaQueryStatus()
     }
+
+    // G1-only build: the AR99 and Mentra Live camera/gallery/button commands
+    // were removed with their drivers. Stubs keep the public API compiling and
+    // reject cleanly at runtime.
+    private static let unsupportedDevice = BluetoothSdkError(
+        code: "unsupported_device", message: "This command requires Mentra Live glasses.")
 
     func startAr99OtaFromFile(_ path: String) throws -> Bool {
-        guard let ar99 = sgc as? Ar99 else {
-            throw BluetoothSdkError(code: "unsupported_device", message: "This command requires AR99 glasses.")
-        }
-        return ar99.startOtaFromFile(path)
+        throw Self.unsupportedDevice
     }
 
-    func cancelAr99Ota() {
-        (sgc as? Ar99)?.cancelAr99Ota()
-    }
+    func cancelAr99Ota() {}
 
     func sendAr99FactoryReset() throws {
-        guard let ar99 = sgc as? Ar99 else {
-            throw BluetoothSdkError(code: "unsupported_device", message: "This command requires AR99 glasses.")
-        }
-        ar99.sendFactoryReset()
-    }
-
-    private func liveSgc() throws -> MentraLive {
-        guard let live = sgc as? MentraLive else {
-            throw BluetoothSdkError(code: "unsupported_device", message: "This command requires Mentra Live glasses.")
-        }
-        return live
+        throw Self.unsupportedDevice
     }
 
     func sendGalleryServerEnabled(requestId: String, enabled: Bool) throws {
-        try liveSgc().sendGalleryServerEnabled(requestId: requestId, enabled: enabled)
+        throw Self.unsupportedDevice
     }
 
     func sendTouchGestureDefaultBehaviorEnabled(requestId: String, gesture: TouchGesture, enabled: Bool) throws {
-        try liveSgc().sendTouchGestureDefaultBehaviorEnabled(requestId: requestId, gesture: gesture, enabled: enabled)
+        throw Self.unsupportedDevice
     }
 
     func sendGalleryMode(requestId: String, enabled: Bool) throws {
-        try liveSgc().sendGalleryMode(requestId: requestId, active: enabled)
+        throw Self.unsupportedDevice
     }
 
     func sendButtonPhotoSettings(requestId: String, size: String) throws {
-        try sendButtonPhotoSettings(
-            requestId: requestId,
-            settings: PhotoCaptureDefaults(size: PhotoSize(normalizedRawValue: size))
-        )
+        throw Self.unsupportedDevice
     }
 
     func sendButtonPhotoSettings(requestId: String, settings: PhotoCaptureDefaults) throws {
-        try liveSgc().sendButtonPhotoSettings(requestId: requestId, settings: settings)
+        throw Self.unsupportedDevice
     }
 
     func sendButtonVideoRecordingSettings(requestId: String, width: Int, height: Int, fps: Int) throws {
-        try liveSgc().sendButtonVideoRecordingSettings(requestId: requestId, width: width, height: height, fps: fps)
+        throw Self.unsupportedDevice
     }
 
     func sendButtonMaxRecordingTime(requestId: String, minutes: Int) throws {
-        try liveSgc().sendButtonMaxRecordingTime(requestId: requestId, minutes: minutes)
+        throw Self.unsupportedDevice
     }
 
     func sendCameraFovSetting(requestId: String, fov: Int, roiPosition: Int) throws {
-        try liveSgc().sendCameraFovSetting(requestId: requestId, fov: fov, roiPosition: roiPosition)
+        throw Self.unsupportedDevice
     }
 
     func sendLegacyCameraFovSetting(fov: Int, roiPosition: Int) throws {
-        let glassesConnected = DeviceStore.shared.get("glasses", "connected") as? Bool ?? false
-        guard glassesConnected else {
-            throw BluetoothSdkError(code: "not_connected", message: "Mentra Live glasses are not connected.")
-        }
-        try liveSgc().sendCameraFovSetting(requestId: nil, fov: fov, roiPosition: roiPosition)
+        throw Self.unsupportedDevice
     }
 
     func restoreLegacyCameraFovSetting() throws {
-        let glassesConnected = DeviceStore.shared.get("glasses", "connected") as? Bool ?? false
-        guard glassesConnected else {
-            throw BluetoothSdkError(code: "not_connected", message: "Mentra Live glasses are not connected.")
-        }
-        try liveSgc().sendCameraFovSetting()
+        throw Self.unsupportedDevice
     }
 
     func sendCameraFovOverride(
@@ -1722,21 +1680,15 @@ struct ViewState {
         roiPosition: Int,
         ttlMs: Int
     ) throws {
-        try liveSgc().sendCameraFovOverride(
-            requestId: requestId,
-            leaseId: leaseId,
-            fov: fov,
-            roiPosition: roiPosition,
-            ttlMs: ttlMs
-        )
+        throw Self.unsupportedDevice
     }
 
     func releaseCameraFovOverride(requestId: String, leaseId: String) throws {
-        try liveSgc().releaseCameraFovOverride(requestId: requestId, leaseId: leaseId)
+        throw Self.unsupportedDevice
     }
 
     func sendCameraTuningConfig(requestId: String, anrOn: Bool, gainOn: Bool) throws {
-        try liveSgc().sendCameraTuningConfig(requestId: requestId, anrOn: anrOn, gainOn: gainOn)
+        throw Self.unsupportedDevice
     }
 
     func warmUpCamera(
@@ -1748,36 +1700,18 @@ struct ViewState {
         zsl: Bool? = nil,
         mfnr: Bool? = nil
     ) throws {
-        guard let live = sgc as? MentraLive else {
-            // Fail fast like other camera commands so the SDK promise rejects immediately instead
-            // of hanging until the request timeout with no camera_status.
-            throw BluetoothSdkError(
-                code: "unsupported_device", message: "This command requires Mentra Live glasses.")
-        }
-        live.warmUpCamera(
-            requestId: requestId,
-            size: size,
-            mode: mode,
-            exposureTimeNs: exposureTimeNs,
-            durationMs: durationMs,
-            zsl: zsl,
-            mfnr: mfnr
-        )
+        throw Self.unsupportedDevice
     }
 
     func stopCameraWarmUp(requestId: String) throws {
-        try liveSgc().stopCameraWarmUp(requestId: requestId)
+        throw Self.unsupportedDevice
     }
 
     /// Request version info from glasses.
     /// Glasses will respond with version_info message containing build number, firmware version, etc.
     func requestVersionInfo(requestId: String? = nil) {
         Bridge.log("MAN: 📱 Requesting version info from glasses")
-        if let live = sgc as? MentraLive {
-            live.requestVersionInfo(requestId: requestId)
-        } else {
-            sgc?.requestVersionInfo()
-        }
+        sgc?.requestVersionInfo()
     }
 
     /// Send shutdown command to glasses.
@@ -1851,36 +1785,16 @@ struct ViewState {
 
     /// Mentra Live only: K900 `cs_getvol` / `sr_getvol` (step volume 0-5).
     func getGlassesMediaVolume() async throws -> [String: Any] {
-        guard let live = sgc as? MentraLive else {
-            throw NSError(
-                domain: "DeviceManager",
-                code: 100,
-                userInfo: [NSLocalizedDescriptionKey: "unsupported_device"]
-            )
-        }
-        return try await withCheckedThrowingContinuation {
-            (continuation: CheckedContinuation<[String: Any], Error>) in
-            live.getGlassesMediaVolume { result in
-                continuation.resume(with: result)
-            }
-        }
+        // G1 has no speaker; the Mentra Live K900 volume commands were removed.
+        throw NSError(domain: "DeviceManager", code: 100,
+                      userInfo: [NSLocalizedDescriptionKey: "unsupported_device"])
     }
 
     /// Mentra Live only: K900 `cs_vol` / `sr_vol`.
     func setGlassesMediaVolume(level: Int) async throws -> [String: Any] {
-        guard let live = sgc as? MentraLive else {
-            throw NSError(
-                domain: "DeviceManager",
-                code: 100,
-                userInfo: [NSLocalizedDescriptionKey: "unsupported_device"]
-            )
-        }
-        return try await withCheckedThrowingContinuation {
-            (continuation: CheckedContinuation<[String: Any], Error>) in
-            live.setGlassesMediaVolume(level: level) { result in
-                continuation.resume(with: result)
-            }
-        }
+        // G1 has no speaker; the Mentra Live K900 volume commands were removed.
+        throw NSError(domain: "DeviceManager", code: 100,
+                      userInfo: [NSLocalizedDescriptionKey: "unsupported_device"])
     }
 
     func requestPhoto(_ request: PhotoRequest) {
@@ -1902,31 +1816,12 @@ struct ViewState {
             Bridge.log("MAN: No default wearable, returning")
             return
         }
-        let reconnectTarget =
-            if defaultWearable.contains(DeviceTypes.AR99), !deviceAddress.isEmpty {
-                deviceAddress
-            } else {
-                deviceName
-            }
+        let reconnectTarget = deviceName
         if reconnectTarget.isEmpty {
             Bridge.log("MAN: No reconnect target, returning")
             return
         }
         initSGC(defaultWearable)
-        (sgc as? MentraLive)?.setRequiresAncs(requiresAncs)
-        if let live = sgc as? MentraLive {
-            let pairingState = MentraLivePairingStateStore.shared
-            if pairingState.isRejected {
-                Bridge.log("MAN: connectDefault skipped — Mentra Live pairing_rejected (Pair Again or forget)")
-                return
-            }
-            if pairingState.isPaused {
-                // The manager watches the advertisement and resumes on its own.
-                Bridge.log("MAN: connectDefault deferred — Mentra Live pairing_mode")
-                live.connectById(reconnectTarget)
-                return
-            }
-        }
         searching = true
         sgc?.connectById(reconnectTarget)
         connectDefaultController()
@@ -1972,20 +1867,6 @@ struct ViewState {
             return
         }
 
-        // Only an existing Mentra Live manager is reused. Calling initSGC first would swap out a
-        // manager of another model here, before the queued handoff below disposes of it.
-        if pendingWearable.contains(DeviceTypes.LIVE), let live = sgc as? MentraLive, !live.isManagerKilled {
-            // The pairing scan already found this peripheral. Destroying the
-            // manager here drops it, and the glasses are no longer discoverable
-            // after the BLE bond, so the replacement scan never sees them.
-            Bridge.log("PAIRFLOW: connect_by_name decision=reuse_manager name=\(name)")
-            searching = true
-            pendingDeviceName = name
-            live.setRequiresAncs(requiresAncs)
-            live.connectById(name)
-            return
-        }
-
         Bridge.log("PAIRFLOW: connect_by_name decision=new_manager name=\(name)")
         Task {
             disconnect(clearPendingConnection: false)
@@ -1994,7 +1875,6 @@ struct ViewState {
             self.pendingDeviceName = name
 
             initSGC(self.pendingWearable)
-            (sgc as? MentraLive)?.setRequiresAncs(requiresAncs)
             sgc?.connectById(name)
         }
     }
@@ -2017,10 +1897,8 @@ struct ViewState {
     }
 
     func connectSimulated() {
-        defaultWearable = DeviceTypes.SIMULATED
-        deviceName = DeviceTypes.SIMULATED
-        initSGC(defaultWearable)
-        handleDeviceReady()
+        // G1-only build: the simulated-glasses driver was removed.
+        Bridge.log("MAN: connectSimulated is unavailable in this build")
     }
 
     func disconnect(clearPendingConnection: Bool = true) {
@@ -2091,32 +1969,17 @@ struct ViewState {
         }
         unpairInProgress = true
         defer { unpairInProgress = false }
-        if let nimo = sgc as? Nimo {
-            _ = await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
-                nimo.resetForUnpair { continuation.resume(returning: $0) }
-            }
-            guard (sgc as? Nimo) === nimo else {
-                throw NSError(domain: "NimoUnpair", code: 2,
-                              userInfo: [NSLocalizedDescriptionKey: "Glasses changed during Unpair"])
-            }
-        }
         forget()
     }
 
     func forget() {
         Bridge.log("MAN: Forgetting smart glasses")
-        MentraLivePairingStateStore.shared.update("forget") { $0.onForget() }
         clearOwnerLost()
         clearSecureFirmware()
         clearFormerOwnerKeys()
         // An earlier scan's rows would list the forgotten glasses at the next pairing scan,
         // which keeps rows it finds already listed, though they are not in pairing mode.
         searchResults = []
-        // With no connection object, MentraLive.forget() can't run. Only clear Live's saved
-        // identity when Live is the target: forgetting G1/G2 must not touch a Live unit's.
-        if sgc == nil, defaultWearable.contains(DeviceTypes.LIVE) || pendingWearable.contains(DeviceTypes.LIVE) {
-            MentraLive.clearSavedPeripheral()
-        }
         // Call forget first to stop timers/handlers/reconnect logic
         sgc?.forget()
         disconnect()

@@ -1,12 +1,7 @@
 /** Hardware capability types used by the Engine. */
 
 import { evenRealitiesG1 } from "./capabilities/even-realities-g1";
-import { evenRealitiesG2 } from "./capabilities/even-realities-g2";
-import { mentraDisplay } from "./capabilities/mentra-display";
-import { mentraLive } from "./capabilities/mentra-live";
-import { nimo } from "./capabilities/nimo";
 import { simulatedGlasses } from "./capabilities/simulated-glasses";
-import { vuzixZ100 } from "./capabilities/vuzix-z100";
 import { none } from "./capabilities/none";
 import { DeviceTypes } from "./enums";
 
@@ -185,40 +180,12 @@ export interface Capabilities {
  */
 export const HARDWARE_CAPABILITIES: Record<string, Capabilities> = {
   [evenRealitiesG1.modelName]: evenRealitiesG1,
-  [evenRealitiesG2.modelName]: evenRealitiesG2,
-  [mentraDisplay.modelName]: mentraDisplay,
-  [mentraLive.modelName]: mentraLive,
   [simulatedGlasses.modelName]: simulatedGlasses,
-  [vuzixZ100.modelName]: vuzixZ100,
-  [nimo.modelName]: nimo,
-  [DeviceTypes.MACH1]: vuzixZ100, // Mach1 uses same Vuzix Ultralite hardware as Z100
-  [DeviceTypes.AR99]: {
-    ...evenRealitiesG1,
-    modelName: DeviceTypes.AR99,
-    display: {
-      ...evenRealitiesG1.display,
-      canDisplayBitmap: false,
-      position: undefined,
-    },
-    imu: {...evenRealitiesG1.imu, headUpAngle: undefined},
-    hasMicrophone: true,
-    hasOta: true,
-    microphone: {
-      count: 1,
-      hasVAD: false,
-    },
-  },
   [none.modelName]: none,
 };
 
-export const isNimoModelName = (modelName: string | null | undefined): boolean =>
-  typeof modelName === "string" && /^nimo(?:$|[-\s])/i.test(modelName.trim())
-
 export const getModelCapabilities = (deviceType: DeviceTypes): Capabilities => {
   const modelName = deviceType as string;
-  // Native/device names include "Nimo-7188" while the saved model is "NIMO".
-  // Normalize only NIMO aliases; preserve every other device's lookup behavior.
-  if (isNimoModelName(modelName)) return nimo
   if (!HARDWARE_CAPABILITIES[modelName]) {
     return HARDWARE_CAPABILITIES[DeviceTypes.NONE];
   }
@@ -226,4 +193,4 @@ export const getModelCapabilities = (deviceType: DeviceTypes): Capabilities => {
 };
 
 // export * from "./capabilities"
-export { simulatedGlasses, evenRealitiesG1, evenRealitiesG2, mentraLive, nimo, vuzixZ100, mentraDisplay };
+export { simulatedGlasses, evenRealitiesG1 };

@@ -23,11 +23,6 @@ export {
   getModelCapabilities,
   simulatedGlasses,
   evenRealitiesG1,
-  evenRealitiesG2,
-  mentraLive,
-  nimo,
-  vuzixZ100,
-  mentraDisplay,
 } from "./hardware"
 
 // Applet types

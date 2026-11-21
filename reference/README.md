@@ -14,10 +14,15 @@ packages/miniapp/             @mentra/miniapp — miniapp SDK (session, display,
                               translation modules; what the Translation app calls)
 packages/bluetooth-sdk/       @mentra/bluetooth-sdk — TS layer over the native
                               iOS SDK in ../vendor/bluetooth-sdk/ios
-packages/miniapp-cli/         @mentra/miniapp-cli — build/pack tooling
 packages/cloud-protocol/      @mentra/cloud-protocol — shared wire types
 translation-miniapp/          the Translation miniapp itself
 ```
+
+G1-only / translation-only pruning vs upstream (this workspace):
+the `@mentra/miniapp-cli` package, `translation-miniapp/build.ts`, the
+TTS/wake-word model managers, and every capability profile except
+Even Realities G1 + `none` + `simulated` were removed.
+`types/hardware.ts` and `OfflineSpeechModelService.ts` were edited to match.
 
 ## Usage
 

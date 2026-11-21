@@ -23,8 +23,11 @@ on-device `Translation` framework is available).
   CocoaPods (`pod`/`xcodebuild` absent here is expected).
 - Node v22.23.3 via nvm; `bun` v1.4.5 installed globally via npm
   (`~/.nvm/.../bin/bun`). Network is available.
-- Upstream MentraOS checkout for re-syncing lives at `/home/arash/MentraOS`
-  (branch `dev`, our snapshot: `12683aa66a3c7dc39b4b0c4eaf73ad1d64bfb5dc`).
+- **This repo is fully self-contained.** Nothing in it reads from or resolves
+  through any other checkout. Provenance is recorded in `UPSTREAM.md` as
+  `github.com/Mentra-Community/MentraOS` @ `12683aa66a3c...`; a re-sync means
+  cloning that repo fresh from GitHub into a temp dir and diffing — never
+  wiring imports or file references to another working tree.
 - The phone is paired via USB for Xcode installs only on the Mac; sideloading
   the finished app uses the $99/yr Apple Developer Program.
 
@@ -34,13 +37,15 @@ on-device `Translation` framework is available).
 README.md                  goal, planned pipeline, next steps
 docs/pipeline-map.md       every component: reuse vs build, BLE details, gotchas
 UPSTREAM.md                provenance + the canonical list of OUR modifications
-vendor/bluetooth-sdk/      MentraBluetoothSDK iOS sources (G1 driver, G1Text
-                           text-wall, sherpa-onnx STT, LC3 decoder, xcframework)
-reference/                 Bun workspace: Mentra TS packages + engine closure
+vendor/bluetooth-sdk/      MentraBluetoothSDK iOS sources, G1-only after the
+                           2026-11-20 pruning (G1 driver, G1Text text-wall,
+                           sherpa-onnx STT, LC3 decoder, xcframework)
+reference/                 Bun workspace: Mentra miniapp SDK + engine closure
   bun.lock, package.json   workspace root — bun install / bun run typecheck
   tsconfig.json            maps @mentra/* imports to packages/*/src (no dist build)
-  packages/                @mentra/miniapp, bluetooth-sdk (TS), miniapp-cli, cloud-protocol
-  engine/src/...           33-file engine closure, mirrors upstream paths
+  packages/                @mentra/miniapp, bluetooth-sdk (TS), cloud-protocol
+  engine/src/...           engine closure (G1/simulated/none profiles, STT
+                           wiring, settings store), mirrors upstream paths
   translation-miniapp/     the original Translation miniapp (behavioral spec)
 ```
 
@@ -65,9 +70,14 @@ the Xcode project has not been created (that is next-step #1 in README.md).
    Mach1/Z100 driver removed (+`UltraliteSDK` pod dep), `cloud-protocol` dep
    rewritten to `workspace:*`, `prepare` scripts stripped from vendored
    package.json files, `reference/README.md` for the TS-side edits.
-2. **Mach1 and Vuzix Z100 are deliberately gone.** Do not re-add them or the
-   `UltraliteSDK` pod. `DeviceTypes.MACH1`/`Z100` string constants are inert
-   leftovers; leave them.
+2. **G1 only — and it is enforced in code.** The other glasses drivers were
+   deleted in the 2026-11-20 reduction: SGC factory in `DeviceManager.swift`
+   instantiates only `G1()`, and the Mentra Live/AR99 camera, gallery, button,
+   volume and OTA commands are stubs that throw `unsupported_device`. Do not
+   re-add drivers, `UltraliteSDK`, or `SwiftProtobuf`. Remaining
+   `DeviceTypes.G2`/`LIVE`/... mentions are inert string constants; a couple of
+   public wrappers (`connectSimulated`, AR99 stubs) remain only to keep the
+   Expo adapter compiling — runtime: logs/rejects.
 3. **Typecheck must keep passing** (`bun run typecheck` in `reference/`, exit
    0). `@mentra/*` imports resolve through `reference/tsconfig.json` `paths` —
    never introduce the packages' unbuilt `dist/` expectations or a `baseUrl`
@@ -103,7 +113,9 @@ the Xcode project has not been created (that is next-step #1 in README.md).
 
 1. Mac: Xcode app target + Podfile referencing
    `vendor/bluetooth-sdk/ios/MentraBluetoothSDK.podspec` (pods: SWCompression
-   ~>4.8.0, SwiftProtobuf ~>1.0, onnxruntime-objc 1.18.0).
+   ~>4.8.0, onnxruntime-objc 1.18.0). Treat the first `xcodebuild` as the
+   verification step for the G1-only Swift pruning (UPSTREAM.md lists what was
+   cut and where leftovers may hide).
 2. Wire connect → `didReceiveMicLc3` → LC3 decode → sherpa-onnx → 
    `TranslationSession` → text-wall render.
 3. Later: consider migrating the UI ideas from `reference/translation-miniapp`
