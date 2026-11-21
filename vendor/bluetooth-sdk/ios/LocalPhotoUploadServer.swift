@@ -385,11 +385,7 @@ final class LocalPhotoUploadServer {
       let data = try? JSONSerialization.data(withJSONObject: [value]),
       let json = String(data: data, encoding: .utf8)
     else {
-      return 
-    }
-  }
-}
-      #""""#
+      return #""""#
     }
     return String(json.dropFirst().dropLast())
   }
