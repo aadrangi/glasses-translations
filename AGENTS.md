@@ -59,17 +59,20 @@ bun install          # resolves everything locally + fetches pinned third-party
 bun run typecheck    # tsc 6 strict over engine + packages + miniapp; must stay clean
 ```
 
-There is no test suite, lint config, or CI yet. There is no app target yet —
-the Xcode project has not been created (that is next-step #1 in README.md).
+There is no lint config or CI yet, and no app target — the Xcode project has
+not been created (that is next-step #1 in README.md). `vendor/.../ios/Tests/`
+holds the surviving upstream XCTest files (G1 pairing/text-sanitizer, audio,
+analytics, STT traits); the deleted-device tests were removed with their
+drivers. They only run on a Mac — use them as executable spec, and expect to
+prune a couple of cross-device cases there.
 
 ## Rules for working here
 
 1. **`UPSTREAM.md` is the contract.** Anything under `vendor/` and
    `reference/packages/` / `reference/engine/` is upstream code; if you modify
-   it, record the change there (format: date + what + why). Already-modified:
-   Mach1/Z100 driver removed (+`UltraliteSDK` pod dep), `cloud-protocol` dep
-   rewritten to `workspace:*`, `prepare` scripts stripped from vendored
-   package.json files, `reference/README.md` for the TS-side edits.
+   it, record the change there (format: date + what + why). The current
+   modification list (driver pruning, podspec changes, workspace rewrites) is
+   maintained there — keep it complete.
 2. **G1 only — and it is enforced in code.** The other glasses drivers were
    deleted in the 2026-11-20 reduction: SGC factory in `DeviceManager.swift`
    instantiates only `G1()`, and the Mentra Live/AR99 camera, gallery, button,
@@ -90,6 +93,52 @@ the Xcode project has not been created (that is next-step #1 in README.md).
 6. `node_modules/` is gitignored; `reference/bun.lock` is committed. The
    53 MB `sherpa-onnx.xcframework` is committed on purpose (abandoned-hardware
    preservation) — never replace it with a download step.
+
+## State of the tree after the 2026-11-20 reduction (findings)
+
+**Swift side (`vendor/bluetooth-sdk`) — grep-verified only, NEVER compiled.**
+There is no Swift toolchain here; the first Mac `xcodebuild`/`pod install` is
+the acceptance check. If it complains about a deleted symbol, the fix pattern
+is: delete the reference, or stub it to throw
+`BluetoothSdkError(code: "unsupported_device", …)` — and log the edit in
+`UPSTREAM.md`.
+
+Deliberate leftovers, do not "fix" without reading this list:
+- `DeviceManager` stubs throwing `unsupported_device`: AR99 OTA/factory-reset,
+  gallery server/mode, touch-gesture defaults, button photo/video settings,
+  camera FOV (+legacy/override) / tuning / warm-up, and the Mentra Live K900
+  volume commands. `connectSimulated` and `cancelAr99Ota` log/reject only.
+- The `MentraBluetoothSDK` public wrappers and the Expo adapter
+  (`BluetoothSdkModule.swift`) still expose those stubbed APIs — kept so the
+  adapter compiles; they reject at runtime.
+- `ConnectOptions.enableTransportBridging` is now an inert option (was a
+  Mentra Live transport bridge); `requiresAncs` likewise for G1.
+- `SGCManager.sendGalleryMode()` (no args, protocol default no-op, G1 no-ops
+  it) is a DIFFERENT member from the removed
+  `sendGalleryMode(requestId:enabled:)` — not a leftover.
+- Device name string enums (`DeviceModels.swift`, `Constants.swift`) and
+  `GeneratedChangelogCatalog.swift` still mention removed devices: data only.
+- The podspec's macOS `exclude_files` still lists deleted paths: CocoaPods
+  treats non-matching filters as no-ops.
+- Pod deps are now only `SWCompression ~> 4.8.0` + `onnxruntime-objc 1.18.0`
+  (plus `ExpoModulesCore` solely under `MENTRA_BLUETOOTH_SDK_INCLUDE_EXPO_ADAPTER=1`).
+
+**TS side (`reference/`):**
+- The engine closure keeps the settings-store chain
+  (`stores/settings` → `GlassesReadiness` → storage/mmkv) and the
+  `simulated`/`none` capability profiles ON PURPOSE: they exist so the
+  glasses-mic → native-recognizer wiring reference
+  (`services/LocalSttFallbackCoordinator.ts`) typechecks, and `none`/
+  `simulated` are the `hardware.ts` fallback profiles. They are reference, not
+  features to port.
+- Removed with typecheck kept green: `@mentra/miniapp-cli`,
+  `translation-miniapp/build.ts`, TTS + wake-word model managers, and all
+  non-G1 capability profiles (`types/hardware.ts` and
+  `OfflineSpeechModelService.ts` were edited to match).
+
+**Repo state:** branch `main`, local only — **no git remote is configured**;
+ask before pushing anywhere. History: seed → reference workspace → AGENTS.md →
+G1-only reduction.
 
 ## Domain facts worth knowing cold
 
